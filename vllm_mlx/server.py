@@ -1934,6 +1934,59 @@ async def stream_chat_completion(
                 # Skip this chunk (e.g., <think> token itself)
                 continue
 
+            # Check if tool call markup appears in reasoning or content.
+            # Some models (e.g. Qwen3-Coder) emit <tool_call> directly
+            # inside reasoning without a </think> transition, so we need to
+            # intercept tool call tokens regardless of which field they land in.
+            effective_text = delta_msg.content or delta_msg.reasoning or ""
+            if tool_parser and effective_text:
+                if not tool_markup_possible and "<" not in effective_text:
+                    tool_accumulated_text += effective_text
+                    # No tool markup yet — emit the delta as-is
+                else:
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+                    tool_previous = tool_accumulated_text
+                    tool_accumulated_text += effective_text
+                    tool_result = tool_parser.extract_tool_calls_streaming(
+                        tool_previous, tool_accumulated_text, effective_text,
+                    )
+
+                    if tool_result is None:
+                        # Inside tool markup — suppress output entirely
+                        continue
+
+                    if "tool_calls" in tool_result:
+                        # Emit structured tool calls instead of reasoning/content
+                        tool_calls_detected = True
+                        chunk = ChatCompletionChunk(
+                            id=response_id,
+                            model=request.model,
+                            choices=[
+                                ChatCompletionChunkChoice(
+                                    delta=ChatCompletionChunkDelta(
+                                        tool_calls=tool_result["tool_calls"]
+                                    ),
+                                    finish_reason=(
+                                        "tool_calls" if output.finished else None
+                                    ),
+                                )
+                            ],
+                            usage=get_usage(output) if output.finished else None,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        continue
+
+                    # Tool parser returned content (not a tool call) — use it
+                    tool_content = tool_result.get("content", "")
+                    if tool_content:
+                        if delta_msg.reasoning:
+                            delta_msg.reasoning = tool_content
+                            delta_msg.content = None
+                        else:
+                            delta_msg.content = tool_content
+                            delta_msg.reasoning = None
+
             chunk = ChatCompletionChunk(
                 id=response_id,
                 model=request.model,
