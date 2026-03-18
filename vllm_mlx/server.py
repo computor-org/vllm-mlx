@@ -2033,9 +2033,7 @@ async def stream_chat_completion(
                                         tool_calls=tool_result["tool_calls"],
                                     ),
                                     finish_reason=(
-                                        "tool_calls"
-                                        if output.finished
-                                        else None
+                                        "tool_calls" if output.finished else None
                                     ),
                                 )
                             ],
@@ -2062,9 +2060,7 @@ async def stream_chat_completion(
                         finish_reason=(
                             "tool_calls"
                             if (output.finished and tool_calls_detected)
-                            else (
-                                output.finish_reason if output.finished else None
-                            )
+                            else (output.finish_reason if output.finished else None)
                         ),
                     )
                 ],
