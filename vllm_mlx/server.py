@@ -1949,7 +1949,9 @@ async def stream_chat_completion(
                     tool_previous = tool_accumulated_text
                     tool_accumulated_text += effective_text
                     tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, effective_text,
+                        tool_previous,
+                        tool_accumulated_text,
+                        effective_text,
                     )
 
                     if tool_result is None:
@@ -1999,9 +2001,7 @@ async def stream_chat_completion(
                         finish_reason=(
                             "tool_calls"
                             if (output.finished and tool_calls_detected)
-                            else (
-                                output.finish_reason if output.finished else None
-                            )
+                            else (output.finish_reason if output.finished else None)
                         ),
                     )
                 ],
