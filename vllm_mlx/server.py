@@ -2838,8 +2838,8 @@ async def init_mcp(config_path: str):
 # =============================================================================
 
 
-def main():
-    """Run the server."""
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Build the CLI argument parser."""
     parser = argparse.ArgumentParser(
         description="vllm-mlx OpenAI-compatible server for LLM and MLLM inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2860,6 +2860,12 @@ Examples:
         type=str,
         default="mlx-community/Llama-3.2-3B-Instruct-4bit",
         help="Model to load (HuggingFace model name or local path)",
+    )
+    parser.add_argument(
+        "--served-model-name",
+        type=str,
+        default=None,
+        help="Alias exposed via /v1/models and request validation",
     )
     parser.add_argument(
         "--host",
@@ -2945,6 +2951,12 @@ Examples:
         default=None,
         help="Default top_p for generation when not specified in request",
     )
+    return parser
+
+
+def main():
+    """Run the server."""
+    parser = build_arg_parser()
 
     args = parser.parse_args()
 
@@ -3002,6 +3014,7 @@ Examples:
         use_batching=args.continuous_batching,
         max_tokens=args.max_tokens,
         force_mllm=args.mllm,
+        served_model_name=args.served_model_name,
     )
 
     # Start server

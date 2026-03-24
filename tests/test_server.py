@@ -167,6 +167,27 @@ class TestCompletionRequest:
         assert request.max_tokens is None  # uses _default_max_tokens when None
 
 
+class TestServerCli:
+    """Test CLI argument parsing."""
+
+    def test_served_model_name_argument(self):
+        """Test that --served-model-name is accepted and parsed."""
+        from vllm_mlx.server import build_arg_parser
+
+        parser = build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--model",
+                "mlx-community/Qwen3.5-4B-MLX-8bit",
+                "--served-model-name",
+                "qwen",
+            ]
+        )
+
+        assert args.model == "mlx-community/Qwen3.5-4B-MLX-8bit"
+        assert args.served_model_name == "qwen"
+
+
 # =============================================================================
 # Helper Function Tests
 # =============================================================================
