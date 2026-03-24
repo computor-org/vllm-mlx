@@ -101,6 +101,7 @@ from .api.responses_models import (
     ResponseFunctionCallItem,
     ResponseFunctionCallOutputItem,
     ResponseFunctionTool,
+    ResponseIncompleteDetails,
     ResponseInProgressEvent,
     ResponseMessageItem,
     ResponseObject,
@@ -572,6 +573,11 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
                         "content": item.get("output", ""),
                     }
                 )
+            elif item_type == "reasoning":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Responses reasoning input items are not supported on this backend",
+                )
             else:
                 logger.info(
                     "Skipping unsupported Responses input item type %r", item_type
@@ -614,10 +620,10 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
                 }
             )
         elif isinstance(item, ResponseReasoningItem):
-            # Reasoning items are metadata from previous turns; keep them out of the
-            # model prompt because the underlying backend only consumes plain chat
-            # messages plus tool-call markers.
-            continue
+            raise HTTPException(
+                status_code=400,
+                detail="Responses reasoning input items are not supported on this backend",
+            )
         else:
             logger.info(
                 "Skipping unsupported Responses input item type %r",
@@ -629,9 +635,11 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
 
 def _responses_request_to_chat_request(request: ResponsesRequest) -> ChatCompletionRequest:
     """Build a ChatCompletionRequest from a ResponsesRequest."""
-    response_format = None
     if request.text.format.type == "json_object":
-        response_format = {"type": "json_object"}
+        raise HTTPException(
+            status_code=400,
+            detail="Responses text.format.type='json_object' is not supported on this backend",
+        )
 
     tools, unsupported_tools = _responses_tools_to_chat_tools(request.tools)
     messages = _responses_input_to_chat_messages(request)
@@ -670,7 +678,6 @@ def _responses_request_to_chat_request(request: ResponsesRequest) -> ChatComplet
         stream=False,
         tools=tools,
         tool_choice=request.tool_choice,
-        response_format=response_format,
     )
 
 
@@ -751,6 +758,7 @@ def _build_response_object(
     output_items: list[ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem],
     prompt_tokens: int,
     completion_tokens: int,
+    finish_reason: str | None,
     response_id: str | None = None,
 ) -> ResponseObject:
     """Build a full Responses API object."""
@@ -777,6 +785,11 @@ def _build_response_object(
             total_tokens=prompt_tokens + completion_tokens,
         ),
     )
+    if finish_reason == "length":
+        response.status = "incomplete"
+        response.incomplete_details = ResponseIncompleteDetails(
+            reason="max_output_tokens"
+        )
     return response
 
 
@@ -840,9 +853,14 @@ async def _run_responses_request(
         output_items=output_items,
         prompt_tokens=output.prompt_tokens,
         completion_tokens=output.completion_tokens,
+        finish_reason=output.finish_reason,
     )
 
-    persisted_messages = _responses_input_to_chat_messages(request)
+    persisted_messages = [
+        msg
+        for msg in _responses_input_to_chat_messages(request)
+        if msg.get("role") != "system"
+    ]
     persisted_messages.extend(_response_output_items_to_chat_messages(output_items))
     if request.store:
         _responses_store[response_object.id] = {
@@ -2135,17 +2153,17 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 )
 async def create_response(request: ResponsesRequest, raw_request: Request):
     """Create a Responses API response."""
+    if request.stream:
+        raise HTTPException(
+            status_code=400,
+            detail="Responses streaming is not supported on this backend",
+        )
+
     response_object, _persisted_messages = await _run_responses_request(
         request, raw_request
     )
     if response_object is None:
         return Response(status_code=499)
-
-    if request.stream:
-        return StreamingResponse(
-            _disconnect_guard(_stream_response_object(response_object), raw_request),
-            media_type="text/event-stream",
-        )
 
     return response_object
 
