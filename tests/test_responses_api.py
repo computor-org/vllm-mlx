@@ -148,6 +148,42 @@ class TestResponsesEndpoint:
         assert second_messages[2]["role"] == "assistant"
         assert second_messages[3]["role"] == "user"
 
+    def test_previous_response_id_preserves_prior_system_message_items(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("First answer"), _output("Second answer"))
+        srv._engine = engine
+
+        first = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": [
+                    {"type": "message", "role": "system", "content": "Persist me"},
+                    {"type": "message", "role": "user", "content": "First prompt"},
+                ],
+            },
+        )
+        first_id = first.json()["id"]
+
+        second = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "previous_response_id": first_id,
+                "input": "Follow-up prompt",
+            },
+        )
+
+        assert second.status_code == 200
+        second_messages = engine.chat.call_args_list[1].kwargs["messages"]
+        assert second_messages[0]["role"] == "system"
+        assert second_messages[0]["content"] == "Persist me"
+        assert second_messages[1]["role"] == "user"
+        assert second_messages[1]["content"] == "First prompt"
+        assert second_messages[2]["role"] == "assistant"
+        assert second_messages[3]["role"] == "user"
+
     def test_developer_role_is_normalized_to_system(self, client):
         import vllm_mlx.server as srv
 
@@ -332,6 +368,23 @@ class TestResponsesEndpoint:
 
         assert resp.status_code == 400
         assert "json_object" in resp.json()["detail"]
+
+    def test_reasoning_configuration_is_rejected(self, client):
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("Hello"))
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "reasoning": {"effort": "xhigh"},
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "reasoning configuration" in resp.json()["detail"]
 
     def test_reasoning_input_item_is_rejected(self, client):
         import vllm_mlx.server as srv
