@@ -298,18 +298,23 @@ class TestResponsesEndpoint:
         assert body["output"][0]["name"] == "shell"
         assert body["output_text"] == ""
 
-    def test_streaming_response_is_rejected(self, client):
+    def test_streaming_response_returns_sse_events(self, client):
         import vllm_mlx.server as srv
 
         srv._engine = _mock_engine(_output("Hello stream"))
 
-        resp = client.post(
+        with client.stream(
+            "POST",
             "/v1/responses",
             json={"model": "test-model", "input": "Hello", "stream": True},
-        )
+        ) as resp:
+            body = "".join(resp.iter_text())
 
-        assert resp.status_code == 400
-        assert "streaming is not supported" in resp.json()["detail"]
+        assert resp.status_code == 200
+        assert "event: response.created" in body
+        assert "event: response.output_text.delta" in body
+        assert "Hello stream" in body
+        assert "event: response.completed" in body
 
     def test_json_object_response_format_is_rejected(self, client):
         import vllm_mlx.server as srv

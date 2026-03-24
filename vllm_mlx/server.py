@@ -2155,17 +2155,17 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 )
 async def create_response(request: ResponsesRequest, raw_request: Request):
     """Create a Responses API response."""
-    if request.stream:
-        raise HTTPException(
-            status_code=400,
-            detail="Responses streaming is not supported on this backend",
-        )
-
     response_object, _persisted_messages = await _run_responses_request(
         request, raw_request
     )
     if response_object is None:
         return Response(status_code=499)
+
+    if request.stream:
+        return StreamingResponse(
+            _stream_response_object(response_object),
+            media_type="text/event-stream",
+        )
 
     return response_object
 
