@@ -30,7 +30,7 @@ class ResponseTextConfig(BaseModel):
 class ResponseReasoningConfig(BaseModel):
     """Reasoning configuration."""
 
-    effort: Literal["low", "medium", "high"] | None = None
+    effort: Literal["none", "minimal", "low", "medium", "high", "xhigh"] | None = None
 
 
 class ResponseTextContentPart(BaseModel):

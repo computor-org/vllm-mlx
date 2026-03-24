@@ -633,12 +633,30 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
     return messages
 
 
+def _responses_request_to_persisted_messages(request: ResponsesRequest) -> list[dict]:
+    """Persist only replayable request input items for previous_response_id.
+
+    Responses `instructions` are intentionally not replayed across
+    `previous_response_id`, but user/developer/system message items are.
+    """
+    request_without_history = request.model_copy(
+        update={"previous_response_id": None, "instructions": None},
+        deep=True,
+    )
+    return _responses_input_to_chat_messages(request_without_history)
+
+
 def _responses_request_to_chat_request(request: ResponsesRequest) -> ChatCompletionRequest:
     """Build a ChatCompletionRequest from a ResponsesRequest."""
     if request.text.format.type == "json_object":
         raise HTTPException(
             status_code=400,
             detail="Responses text.format.type='json_object' is not supported on this backend",
+        )
+    if request.reasoning is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Responses reasoning configuration is not supported on this backend",
         )
 
     tools, unsupported_tools = _responses_tools_to_chat_tools(request.tools)
@@ -856,11 +874,7 @@ async def _run_responses_request(
         finish_reason=output.finish_reason,
     )
 
-    persisted_messages = [
-        msg
-        for msg in _responses_input_to_chat_messages(request)
-        if msg.get("role") != "system"
-    ]
+    persisted_messages = _responses_request_to_persisted_messages(request)
     persisted_messages.extend(_response_output_items_to_chat_messages(output_items))
     if request.store:
         _responses_store[response_object.id] = {
