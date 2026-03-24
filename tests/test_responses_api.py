@@ -112,6 +112,56 @@ class TestResponsesEndpoint:
         assert second_messages[2]["role"] == "user"
         assert second_messages[2]["content"] == "Follow-up prompt"
 
+    def test_developer_role_is_normalized_to_system(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("Ready"))
+        srv._engine = engine
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": [
+                    {"type": "message", "role": "user", "content": "Hi"},
+                    {"type": "message", "role": "developer", "content": "Be terse"},
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        messages = engine.chat.call_args.kwargs["messages"]
+        assert messages[0]["role"] == "system"
+        assert messages[0]["content"] == "Be terse"
+        assert messages[1]["role"] == "user"
+        assert messages[1]["content"] == "Hi"
+
+    def test_instructions_and_developer_message_are_merged(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("Ready"))
+        srv._engine = engine
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "instructions": "System instructions",
+                "input": [
+                    {"type": "message", "role": "developer", "content": "Developer note"},
+                    {"type": "message", "role": "user", "content": "Hi"},
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        messages = engine.chat.call_args.kwargs["messages"]
+        assert len([m for m in messages if m["role"] == "system"]) == 1
+        assert messages[0]["role"] == "system"
+        assert "System instructions" in messages[0]["content"]
+        assert "Developer note" in messages[0]["content"]
+        assert messages[1]["role"] == "user"
+
     def test_function_call_output_input_is_mapped_cleanly(self, client):
         import vllm_mlx.server as srv
 
