@@ -453,6 +453,8 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+
         # mlx-lm non-streaming chat with tools can stall indefinitely on some
         # local models, while the streaming path completes normally. Reuse the
         # streaming implementation and aggregate its final state so both chat
@@ -550,6 +552,8 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -626,6 +630,8 @@ class SimpleEngine(BaseEngine):
                 "add_generation_prompt": True,
                 "enable_thinking": enable_thinking,
             }
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
             if template_tools:
                 template_kwargs["tools"] = template_tools
 
@@ -633,7 +639,7 @@ class SimpleEngine(BaseEngine):
                 prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
             except TypeError:
                 # Some templates don't support all kwargs
-                for key in ["tools", "enable_thinking"]:
+                for key in ["tools", "enable_thinking", *chat_template_kwargs.keys()]:
                     if key in template_kwargs:
                         del template_kwargs[key]
                 prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
