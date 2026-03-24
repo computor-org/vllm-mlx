@@ -538,9 +538,12 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
         if isinstance(item, dict):
             item_type = item.get("type", "")
             if item_type == "message":
+                role = item.get("role", "user")
+                if role == "developer":
+                    role = "system"
                 messages.append(
                     {
-                        "role": item.get("role", "user"),
+                        "role": role,
                         "content": _response_content_to_text(item.get("content")),
                     }
                 )
@@ -576,9 +579,12 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
             continue
 
         if isinstance(item, ResponseMessageItem):
+            role = item.role
+            if role == "developer":
+                role = "system"
             messages.append(
                 {
-                    "role": item.role,
+                    "role": role,
                     "content": _response_content_to_text(item.content),
                 }
             )
@@ -641,6 +647,19 @@ def _responses_request_to_chat_request(request: ResponsesRequest) -> ChatComplet
                 ),
             },
         )
+
+    system_messages = [msg for msg in messages if msg.get("role") == "system"]
+    non_system_messages = [msg for msg in messages if msg.get("role") != "system"]
+    merged_system_content = "\n\n".join(
+        str(msg.get("content", "")).strip()
+        for msg in system_messages
+        if str(msg.get("content", "")).strip()
+    )
+    messages = (
+        [{"role": "system", "content": merged_system_content}]
+        if merged_system_content
+        else []
+    ) + non_system_messages
 
     return ChatCompletionRequest(
         model=request.model,
