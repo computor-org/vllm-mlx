@@ -134,7 +134,7 @@ class TestSimpleEngineConcurrency:
                 finished=False,
             )
             yield MagicMock(
-                text='<tool_call>{"name":"bash","arguments":{"command":"pwd"}}</tool_call>',
+                text="<|im_end|><tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}</tool_call>",
                 tokens=[],
                 prompt_tokens=11,
                 completion_tokens=4,
@@ -146,6 +146,7 @@ class TestSimpleEngineConcurrency:
             engine = SimpleEngine("test-model")
             engine._model = mock_llm_model
             engine._loaded = True
+            engine._model.tokenizer.encode = MagicMock(return_value=[7, 8, 9])
             engine.stream_chat = fake_stream_chat  # type: ignore[method-assign]
 
             output = await engine.chat(
@@ -163,10 +164,81 @@ class TestSimpleEngineConcurrency:
             )
 
             assert output.text.startswith("<tool_call>")
+            assert output.tokens == [7, 8, 9]
             assert output.prompt_tokens == 11
-            assert output.completion_tokens == 4
+            assert output.completion_tokens == 3
             assert output.finish_reason == "stop"
             mock_llm_model.chat.assert_not_called()
+            engine._model.tokenizer.encode.assert_called_once_with(
+                output.text, add_special_tokens=False
+            )
+
+    @pytest.mark.anyio
+    async def test_stream_generate_specprefill_does_not_prelock_serialized_runner(
+        self,
+    ):
+        """Specprefill path must let _run_blocking_serialized own the lock."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        async def fake_serialized(func, *args, **kwargs):
+            assert not engine._generation_lock.locked()
+            return []
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine._model = MagicMock()
+            engine._model.model = MagicMock()
+            engine._model.tokenizer = MagicMock()
+            engine._draft_model = MagicMock()
+            engine._run_blocking_serialized = fake_serialized  # type: ignore[method-assign]
+
+            outputs = []
+            async for chunk in engine._stream_generate_specprefill(
+                prompt="hello",
+                tokens=[1, 2, 3, 4],
+                max_tokens=4,
+                temperature=0.7,
+                top_p=0.9,
+            ):
+                outputs.append(chunk)
+
+            assert len(outputs) == 1
+            assert outputs[0].finished is True
+            assert outputs[0].completion_tokens == 0
+
+    @pytest.mark.anyio
+    async def test_stream_generate_text_does_not_prelock_serialized_runner(self):
+        """Text MTP path must let _run_blocking_serialized own the lock."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        async def fake_serialized(func, *args, **kwargs):
+            assert not engine._generation_lock.locked()
+            return []
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=True):
+            engine = SimpleEngine("test-model")
+            engine._loaded = True
+            engine._text_model = MagicMock()
+            engine._text_model.make_mtp_cache = MagicMock(return_value=[])
+            engine._text_tokenizer = MagicMock()
+            engine._text_tokenizer.apply_chat_template = MagicMock(return_value="hello")
+            engine._text_tokenizer.bos_token = None
+            engine._draft_model = None
+            engine._run_blocking_serialized = fake_serialized  # type: ignore[method-assign]
+
+            outputs = []
+            async for chunk in engine._stream_generate_text(
+                messages=[{"role": "user", "content": "hello"}],
+                max_tokens=4,
+                temperature=0.7,
+                top_p=0.9,
+            ):
+                outputs.append(chunk)
+
+            assert len(outputs) == 1
+            assert outputs[0].finished is True
+            assert outputs[0].completion_tokens == 0
 
     @pytest.mark.anyio
     async def test_lock_serializes_stream_generate(self, mock_model):
