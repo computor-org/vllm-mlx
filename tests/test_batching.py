@@ -7,8 +7,10 @@ for the vLLM-style continuous batching implementation.
 """
 
 import asyncio
+import importlib
 import pytest
 from unittest.mock import MagicMock
+import mlx.core as mx
 
 from vllm_mlx.request import (
     Request,
@@ -20,7 +22,10 @@ from vllm_mlx.scheduler import (
     Scheduler,
     SchedulerConfig,
     SchedulingPolicy,
+    _install_chunked_prefill,
 )
+
+mlx_generate = importlib.import_module("mlx_lm.generate")
 
 
 class TestRequest:
@@ -210,6 +215,73 @@ class TestSchedulerBasic:
     def mock_model(self):
         """Create a mock model."""
         return MagicMock()
+
+    def test_chunked_prefill_accepts_prompt_checkpoints(self, monkeypatch):
+        """Chunked prefill must match mlx-lm's 7-field prompt tuples."""
+
+        class FakeCacheEntry:
+            def empty(self):
+                return True
+
+        class FakePromptCache:
+            def __init__(self):
+                self.state = mx.array([0])
+
+            def finalize(self):
+                return None
+
+        class FakeStats:
+            prompt_tokens = 0
+            prompt_time = 0.0
+            generation_time = 0.0
+
+        class FakeBatchGenerator:
+            def __init__(self):
+                self._stats = FakeStats()
+                self._partial = None
+                self.active_batch = None
+                self.unprocessed_prompts = [
+                    (
+                        7,
+                        [1, 2, 3, 4, 5],
+                        16,
+                        [FakeCacheEntry()],
+                        None,
+                        [None],
+                        2,
+                    )
+                ]
+                self.prefill_batch_size = 1
+                self.completion_batch_size = 1
+                self.max_kv_size = None
+                self.stop_tokens = set()
+                self.prompt_progress_callback = lambda _progress: None
+                self.prompt_checkpoint_callback = None
+                self._next = lambda: []
+                self.remove = lambda _uids: None
+                self._process_prompts = lambda _prompts: None
+                self.model = lambda _inputs, cache=None: None
+
+        monkeypatch.setattr(
+            mlx_generate,
+            "_left_pad_prompts",
+            lambda prompts, max_length=None: mx.array(prompts),
+        )
+        monkeypatch.setattr(
+            mlx_generate,
+            "_make_cache",
+            lambda _model, _padding, _max_kv_size=None: [FakePromptCache()],
+        )
+
+        batch_gen = FakeBatchGenerator()
+        _install_chunked_prefill(batch_gen, budget=4)
+
+        responses = batch_gen._next()
+
+        assert responses == []
+        assert batch_gen._partial is not None
+        assert batch_gen._partial["prompt_checkpoint"] == 3
+        assert batch_gen._partial["processed"] == 2
 
     def test_scheduler_creation(self, mock_model, mock_tokenizer):
         """Test scheduler creation."""
