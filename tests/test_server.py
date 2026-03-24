@@ -167,7 +167,6 @@ class TestCompletionRequest:
         assert request.max_tokens is None  # uses _default_max_tokens when None
 
 
-<<<<<<< HEAD
 class TestServeCli:
     """Test CLI argument parsing."""
 
