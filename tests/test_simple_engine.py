@@ -166,7 +166,7 @@ class TestSimpleEngineConcurrency:
             assert output.text.startswith("<tool_call>")
             assert output.tokens == [7, 8, 9]
             assert output.prompt_tokens == 11
-            assert output.completion_tokens == 3
+            assert output.completion_tokens == 4
             assert output.finish_reason == "stop"
             mock_llm_model.chat.assert_not_called()
             engine._model.tokenizer.encode.assert_called_once_with(

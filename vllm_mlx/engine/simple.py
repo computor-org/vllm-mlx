@@ -479,7 +479,7 @@ class SimpleEngine(BaseEngine):
                 text=text,
                 tokens=tokens,
                 prompt_tokens=final_output.prompt_tokens,
-                completion_tokens=len(tokens),
+                completion_tokens=final_output.completion_tokens,
                 finish_reason=final_output.finish_reason,
             )
 
