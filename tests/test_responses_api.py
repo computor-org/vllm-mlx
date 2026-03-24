@@ -112,6 +112,42 @@ class TestResponsesEndpoint:
         assert second_messages[2]["role"] == "user"
         assert second_messages[2]["content"] == "Follow-up prompt"
 
+    def test_previous_response_id_does_not_carry_prior_instructions(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(_output("First answer"), _output("Second answer"))
+        srv._engine = engine
+
+        first = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "instructions": "First system instruction",
+                "input": "First prompt",
+            },
+        )
+        first_id = first.json()["id"]
+
+        second = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "instructions": "Second system instruction",
+                "previous_response_id": first_id,
+                "input": "Follow-up prompt",
+            },
+        )
+
+        assert second.status_code == 200
+        second_messages = engine.chat.call_args_list[1].kwargs["messages"]
+        assert second_messages[0]["role"] == "system"
+        assert second_messages[0]["content"] == "Second system instruction"
+        assert "First system instruction" not in second_messages[0]["content"]
+        assert second_messages[1]["role"] == "user"
+        assert second_messages[1]["content"] == "First prompt"
+        assert second_messages[2]["role"] == "assistant"
+        assert second_messages[3]["role"] == "user"
+
     def test_developer_role_is_normalized_to_system(self, client):
         import vllm_mlx.server as srv
 
@@ -262,21 +298,68 @@ class TestResponsesEndpoint:
         assert body["output"][0]["name"] == "shell"
         assert body["output_text"] == ""
 
-    def test_streaming_response_events(self, client):
+    def test_streaming_response_is_rejected(self, client):
         import vllm_mlx.server as srv
 
         srv._engine = _mock_engine(_output("Hello stream"))
 
-        with client.stream(
-            "POST",
+        resp = client.post(
             "/v1/responses",
             json={"model": "test-model", "input": "Hello", "stream": True},
-        ) as resp:
-            stream_text = "".join(resp.iter_text())
+        )
+
+        assert resp.status_code == 400
+        assert "streaming is not supported" in resp.json()["detail"]
+
+    def test_json_object_response_format_is_rejected(self, client):
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("Hello"))
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Hello",
+                "text": {"format": {"type": "json_object"}},
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "json_object" in resp.json()["detail"]
+
+    def test_reasoning_input_item_is_rejected(self, client):
+        import vllm_mlx.server as srv
+
+        srv._engine = _mock_engine(_output("Hello"))
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": [
+                    {"type": "message", "role": "user", "content": "Hello"},
+                    {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "x"}]},
+                ],
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "reasoning input items are not supported" in resp.json()["detail"]
+
+    def test_length_finish_reason_marks_response_incomplete(self, client):
+        import vllm_mlx.server as srv
+
+        output = _output("Cut off", completion_tokens=5)
+        output.finish_reason = "length"
+        srv._engine = _mock_engine(output)
+
+        resp = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "Hello", "max_output_tokens": 5},
+        )
 
         assert resp.status_code == 200
-        assert "event: response.created" in stream_text
-        assert "event: response.in_progress" in stream_text
-        assert "event: response.output_text.delta" in stream_text
-        assert "event: response.completed" in stream_text
-        assert "Hello stream" in stream_text
+        body = resp.json()
+        assert body["status"] == "incomplete"
+        assert body["incomplete_details"] == {"reason": "max_output_tokens"}
