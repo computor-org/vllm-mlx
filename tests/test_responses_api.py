@@ -50,6 +50,16 @@ def _mock_engine(*outputs):
     engine.model_name = "test-model"
     engine.preserve_native_tool_format = False
     engine.chat = AsyncMock(side_effect=list(outputs))
+    stream_calls = []
+
+    async def _stream_chat(**kwargs):
+        stream_calls.append(kwargs)
+        for output in getattr(engine, "_stream_outputs", []):
+            yield output
+
+    engine._stream_calls = stream_calls
+    engine._stream_outputs = []
+    engine.stream_chat = _stream_chat
     return engine
 
 
@@ -59,6 +69,22 @@ def _output(text: str, prompt_tokens: int = 7, completion_tokens: int = 3):
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         finish_reason="stop",
+    )
+
+
+def _stream_output(
+    new_text: str,
+    prompt_tokens: int = 7,
+    completion_tokens: int = 1,
+    finish_reason: str | None = None,
+):
+    return SimpleNamespace(
+        new_text=new_text,
+        text=new_text,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        finish_reason=finish_reason,
+        finished=finish_reason is not None,
     )
 
 
@@ -111,6 +137,54 @@ class TestResponsesEndpoint:
         assert second_messages[1]["content"] == "First answer"
         assert second_messages[2]["role"] == "user"
         assert second_messages[2]["content"] == "Follow-up prompt"
+
+    def test_previous_response_id_chains_across_multiple_follow_ups(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(
+            _output("First answer"),
+            _output("Second answer"),
+            _output("Third answer"),
+        )
+        srv._engine = engine
+
+        first = client.post(
+            "/v1/responses",
+            json={"model": "test-model", "input": "First prompt"},
+        )
+        first_id = first.json()["id"]
+
+        second = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "previous_response_id": first_id,
+                "input": "Second prompt",
+            },
+        )
+        second_id = second.json()["id"]
+
+        third = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "previous_response_id": second_id,
+                "input": "Third prompt",
+            },
+        )
+
+        assert third.status_code == 200
+        third_messages = engine.chat.call_args_list[2].kwargs["messages"]
+        assert third_messages[0]["role"] == "user"
+        assert third_messages[0]["content"] == "First prompt"
+        assert third_messages[1]["role"] == "assistant"
+        assert third_messages[1]["content"] == "First answer"
+        assert third_messages[2]["role"] == "user"
+        assert third_messages[2]["content"] == "Second prompt"
+        assert third_messages[3]["role"] == "assistant"
+        assert third_messages[3]["content"] == "Second answer"
+        assert third_messages[4]["role"] == "user"
+        assert third_messages[4]["content"] == "Third prompt"
 
     def test_previous_response_id_does_not_carry_prior_instructions(self, client):
         import vllm_mlx.server as srv
@@ -337,7 +411,13 @@ class TestResponsesEndpoint:
     def test_streaming_response_returns_sse_events(self, client):
         import vllm_mlx.server as srv
 
-        srv._engine = _mock_engine(_output("Hello stream"))
+        engine = _mock_engine(_output("unused"))
+        engine.chat = AsyncMock(side_effect=AssertionError("stream path should not call chat"))
+        engine._stream_outputs = [
+            _stream_output("Hello ", completion_tokens=1),
+            _stream_output("stream", completion_tokens=2, finish_reason="stop"),
+        ]
+        srv._engine = engine
 
         with client.stream(
             "POST",
@@ -351,6 +431,8 @@ class TestResponsesEndpoint:
         assert "event: response.output_text.delta" in body
         assert "Hello stream" in body
         assert "event: response.completed" in body
+        assert len(engine._stream_calls) == 1
+        engine.chat.assert_not_awaited()
 
     def test_json_object_response_format_is_rejected(self, client):
         import vllm_mlx.server as srv
