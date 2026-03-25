@@ -54,8 +54,8 @@ The full suite is intentionally split in CI:
 - The Ubuntu matrix runs the pure-Python subset only.
 - The Apple Silicon job runs MLX-dependent tests that require macOS on ARM.
 
-If you are running tests locally outside the documented `.[dev]` environment, async tests
-will fail because `pytest-asyncio` is a dev dependency rather than a runtime dependency.
+Async tests run through `anyio` on the asyncio backend. If you are running tests locally,
+use the documented dev environment so the test dependencies match CI.
 
 ### Code Style
 

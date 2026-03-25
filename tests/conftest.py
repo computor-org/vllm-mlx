@@ -4,6 +4,12 @@
 import pytest
 
 
+@pytest.fixture(scope="session")
+def anyio_backend():
+    """Run anyio tests on asyncio consistently across environments."""
+    return "asyncio"
+
+
 def pytest_addoption(parser):
     """Add custom command line options."""
     parser.addoption(
