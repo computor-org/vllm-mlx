@@ -460,6 +460,9 @@ class SimpleEngine(BaseEngine):
         # streaming implementation and aggregate its final state so both chat
         # APIs share the same tool-capable execution path.
         if tools and not self._is_mllm:
+            stream_kwargs = dict(kwargs)
+            if chat_template_kwargs:
+                stream_kwargs["chat_template_kwargs"] = chat_template_kwargs
             final_output = GenerationOutput(text="")
             async for output in self.stream_chat(
                 messages=messages,
@@ -469,7 +472,7 @@ class SimpleEngine(BaseEngine):
                 tools=tools,
                 images=images,
                 videos=videos,
-                **kwargs,
+                **stream_kwargs,
             ):
                 final_output = output
             text = clean_output_text(final_output.text)
@@ -507,6 +510,8 @@ class SimpleEngine(BaseEngine):
                 finish_reason=output.finish_reason,
             )
         else:
+            if chat_template_kwargs:
+                kwargs["chat_template_kwargs"] = chat_template_kwargs
             output = await self._run_blocking_serialized(
                 self._model.chat,
                 messages=messages,

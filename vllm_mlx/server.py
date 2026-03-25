@@ -633,17 +633,32 @@ def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
     return messages
 
 
-def _responses_request_to_persisted_messages(request: ResponsesRequest) -> list[dict]:
-    """Persist only replayable request input items for previous_response_id.
-
-    Responses `instructions` are intentionally not replayed across
-    `previous_response_id`, but user/developer/system message items are.
-    """
+def _responses_request_to_new_persisted_messages(request: ResponsesRequest) -> list[dict]:
+    """Persist only the current request's replayable input items."""
     request_without_history = request.model_copy(
         update={"previous_response_id": None, "instructions": None},
         deep=True,
     )
     return _responses_input_to_chat_messages(request_without_history)
+
+
+def _responses_request_to_persisted_messages(request: ResponsesRequest) -> list[dict]:
+    """Persist replayable history for chained previous_response_id requests.
+
+    Responses `instructions` are intentionally not replayed across
+    `previous_response_id`, but replayable message items are.
+    """
+    messages: list[dict] = []
+    if request.previous_response_id:
+        previous = _responses_store.get(request.previous_response_id)
+        if previous is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Previous response `{request.previous_response_id}` not found",
+            )
+        messages.extend(copy.deepcopy(previous["messages"]))
+    messages.extend(_responses_request_to_new_persisted_messages(request))
+    return messages
 
 
 def _responses_request_to_chat_request(request: ResponsesRequest) -> ChatCompletionRequest:
@@ -811,11 +826,10 @@ def _build_response_object(
     return response
 
 
-async def _run_responses_request(
+def _prepare_responses_request(
     request: ResponsesRequest,
-    raw_request: Request,
-) -> tuple[ResponseObject | None, list[dict]]:
-    """Execute a Responses API request against the backend chat engine."""
+) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
+    """Prepare a Responses request for execution on the chat engine."""
     _validate_model_name(request.model)
     engine = get_engine()
     chat_request = _responses_request_to_chat_request(request)
@@ -844,6 +858,16 @@ async def _run_responses_request(
         chat_kwargs["images"] = images
     if videos:
         chat_kwargs["videos"] = videos
+
+    return engine, chat_request, messages, chat_kwargs
+
+
+async def _run_responses_request(
+    request: ResponsesRequest,
+    raw_request: Request,
+) -> tuple[ResponseObject | None, list[dict]]:
+    """Execute a Responses API request against the backend chat engine."""
+    engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
 
     timeout = _default_timeout
     output = await _wait_with_disconnect(
@@ -883,6 +907,401 @@ async def _run_responses_request(
         }
 
     return response_object, persisted_messages
+
+
+async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[str]:
+    """Execute a Responses API request and stream SSE events incrementally."""
+    engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
+
+    response_id = _new_response_item_id("resp")
+    sequence = 1
+    base_response = _build_response_object(
+        request=request,
+        output_items=[],
+        prompt_tokens=0,
+        completion_tokens=0,
+        finish_reason=None,
+        response_id=response_id,
+    )
+    base_response.status = "in_progress"
+    base_response.usage = None
+
+    yield _responses_sse_event(
+        "response.created",
+        ResponseCreatedEvent(sequence_number=sequence, response=base_response),
+    )
+    sequence += 1
+    yield _responses_sse_event(
+        "response.in_progress",
+        ResponseInProgressEvent(sequence_number=sequence, response=base_response),
+    )
+    sequence += 1
+
+    prompt_tokens = 0
+    completion_tokens = 0
+    finish_reason = None
+    last_output = None
+    raw_accumulated_text = ""
+    accumulated_text = ""
+    accumulated_reasoning = ""
+
+    text_item_id: str | None = None
+    text_output_index: int | None = None
+    reasoning_item_id: str | None = None
+    reasoning_output_index: int | None = None
+    next_output_index = 0
+
+    def _start_text_item() -> list[str]:
+        nonlocal text_item_id, text_output_index, next_output_index, sequence
+        events: list[str] = []
+        if text_item_id is None:
+            text_item_id = _new_response_item_id("msg")
+            text_output_index = next_output_index
+            next_output_index += 1
+            events.append(
+                _responses_sse_event(
+                    "response.output_item.added",
+                    ResponseOutputItemAddedEvent(
+                        sequence_number=sequence,
+                        output_index=text_output_index,
+                        item=ResponseMessageItem(
+                            id=text_item_id,
+                            role="assistant",
+                            status="in_progress",
+                            content=[],
+                        ),
+                    ),
+                )
+            )
+            sequence += 1
+            events.append(
+                _responses_sse_event(
+                    "response.content_part.added",
+                    ResponseContentPartAddedEvent(
+                        sequence_number=sequence,
+                        item_id=text_item_id,
+                        output_index=text_output_index,
+                        content_index=0,
+                        part=ResponseTextContentPart(type="output_text", text=""),
+                    ),
+                )
+            )
+            sequence += 1
+        return events
+
+    def _start_reasoning_item() -> list[str]:
+        nonlocal reasoning_item_id, reasoning_output_index, next_output_index, sequence
+        events: list[str] = []
+        if reasoning_item_id is None:
+            reasoning_item_id = _new_response_item_id("rs")
+            reasoning_output_index = next_output_index
+            next_output_index += 1
+            events.append(
+                _responses_sse_event(
+                    "response.output_item.added",
+                    ResponseOutputItemAddedEvent(
+                        sequence_number=sequence,
+                        output_index=reasoning_output_index,
+                        item=ResponseReasoningItem(
+                            id=reasoning_item_id,
+                            status="in_progress",
+                            content=[],
+                        ),
+                    ),
+                )
+            )
+            sequence += 1
+            events.append(
+                _responses_sse_event(
+                    "response.content_part.added",
+                    ResponseContentPartAddedEvent(
+                        sequence_number=sequence,
+                        item_id=reasoning_item_id,
+                        output_index=reasoning_output_index,
+                        content_index=0,
+                        part=ResponseReasoningTextPart(text=""),
+                    ),
+                )
+            )
+            sequence += 1
+        return events
+
+    if _reasoning_parser:
+        _reasoning_parser.reset_state()
+
+    global _tool_parser_instance
+    tool_parser = None
+    tool_accumulated_text = ""
+    tool_markup_possible = False
+    if _enable_auto_tool_choice and _tool_call_parser:
+        if _tool_parser_instance is None:
+            try:
+                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+                tokenizer = None
+                if _engine is not None and hasattr(_engine, "_tokenizer"):
+                    tokenizer = _engine._tokenizer
+                _tool_parser_instance = parser_cls(tokenizer)
+                logger.info(
+                    "Initialized tool call parser for responses streaming: %s",
+                    _tool_call_parser,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to init tool parser for responses streaming: %s", e
+                )
+        if _tool_parser_instance is not None:
+            tool_parser = _tool_parser_instance
+            tool_parser.reset()
+
+    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+        last_output = output
+        finish_reason = output.finish_reason
+        if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+            prompt_tokens = output.prompt_tokens
+        if hasattr(output, "completion_tokens") and output.completion_tokens:
+            completion_tokens = output.completion_tokens
+
+        delta_text = output.new_text or ""
+        if not delta_text:
+            continue
+
+        previous_text = raw_accumulated_text
+        raw_accumulated_text += delta_text
+
+        if _reasoning_parser:
+            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                previous_text, raw_accumulated_text, delta_text
+            )
+            if delta_msg is None:
+                continue
+
+            if delta_msg.reasoning:
+                for event in _start_reasoning_item():
+                    yield event
+                accumulated_reasoning += delta_msg.reasoning
+                yield _responses_sse_event(
+                    "response.reasoning_text.delta",
+                    ResponseReasoningTextDeltaEvent(
+                        sequence_number=sequence,
+                        item_id=reasoning_item_id,
+                        output_index=reasoning_output_index,
+                        content_index=0,
+                        delta=delta_msg.reasoning,
+                    ),
+                )
+                sequence += 1
+
+            if delta_msg.content:
+                for event in _start_text_item():
+                    yield event
+                accumulated_text += delta_msg.content
+                yield _responses_sse_event(
+                    "response.output_text.delta",
+                    ResponseOutputTextDeltaEvent(
+                        sequence_number=sequence,
+                        item_id=text_item_id,
+                        output_index=text_output_index,
+                        content_index=0,
+                        delta=delta_msg.content,
+                    ),
+                )
+                sequence += 1
+            continue
+
+        content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+        if tool_parser and delta_text:
+            if not tool_markup_possible and "<" not in delta_text:
+                tool_accumulated_text += delta_text
+            else:
+                if not tool_markup_possible:
+                    tool_markup_possible = True
+                tool_result = tool_parser.extract_tool_calls_streaming(
+                    tool_accumulated_text, tool_accumulated_text + delta_text, delta_text
+                )
+                tool_accumulated_text += delta_text
+                if tool_result is None:
+                    continue
+                if "tool_calls" in tool_result:
+                    continue
+                content = tool_result.get("content", "")
+
+        if not content:
+            continue
+
+        for event in _start_text_item():
+            yield event
+        accumulated_text += content
+        yield _responses_sse_event(
+            "response.output_text.delta",
+            ResponseOutputTextDeltaEvent(
+                sequence_number=sequence,
+                item_id=text_item_id,
+                output_index=text_output_index,
+                content_index=0,
+                delta=content,
+            ),
+        )
+        sequence += 1
+
+    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+        raw_accumulated_text, chat_request
+    )
+    final_text = accumulated_text
+    if cleaned_text is not None and not final_text and not tool_calls:
+        final_text = clean_output_text(cleaned_text)
+
+    reasoning_item = None
+    if reasoning_item_id is not None:
+        reasoning_item = ResponseReasoningItem(
+            id=reasoning_item_id,
+            status="completed",
+            content=[ResponseReasoningTextPart(text=accumulated_reasoning)],
+        )
+        yield _responses_sse_event(
+            "response.reasoning_text.done",
+            ResponseReasoningTextDoneEvent(
+                sequence_number=sequence,
+                item_id=reasoning_item_id,
+                output_index=reasoning_output_index,
+                content_index=0,
+                text=accumulated_reasoning,
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.content_part.done",
+            ResponseContentPartDoneEvent(
+                sequence_number=sequence,
+                item_id=reasoning_item_id,
+                output_index=reasoning_output_index,
+                content_index=0,
+                part=reasoning_item.content[0],
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.output_item.done",
+            ResponseOutputItemDoneEvent(
+                sequence_number=sequence,
+                output_index=reasoning_output_index,
+                item=reasoning_item,
+            ),
+        )
+        sequence += 1
+
+    text_item = None
+    if text_item_id is not None or final_text:
+        if text_item_id is None:
+            for event in _start_text_item():
+                yield event
+        text_item = ResponseMessageItem(
+            id=text_item_id,
+            role="assistant",
+            status="completed",
+            content=[ResponseTextContentPart(type="output_text", text=final_text)],
+        )
+        yield _responses_sse_event(
+            "response.output_text.done",
+            ResponseOutputTextDoneEvent(
+                sequence_number=sequence,
+                item_id=text_item_id,
+                output_index=text_output_index,
+                content_index=0,
+                text=final_text,
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.content_part.done",
+            ResponseContentPartDoneEvent(
+                sequence_number=sequence,
+                item_id=text_item_id,
+                output_index=text_output_index,
+                content_index=0,
+                part=text_item.content[0],
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.output_item.done",
+            ResponseOutputItemDoneEvent(
+                sequence_number=sequence,
+                output_index=text_output_index,
+                item=text_item,
+            ),
+        )
+        sequence += 1
+
+    function_call_items: list[ResponseFunctionCallItem] = []
+    for tool_call in tool_calls or []:
+        output_index = next_output_index
+        next_output_index += 1
+        item = ResponseFunctionCallItem(
+            id=_new_response_item_id("fc"),
+            call_id=tool_call.id,
+            name=tool_call.function.name,
+            arguments=tool_call.function.arguments,
+        )
+        function_call_items.append(item)
+        yield _responses_sse_event(
+            "response.output_item.added",
+            ResponseOutputItemAddedEvent(
+                sequence_number=sequence,
+                output_index=output_index,
+                item=item.model_copy(update={"status": "in_progress"}),
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.function_call_arguments.delta",
+            ResponseFunctionCallArgumentsDeltaEvent(
+                sequence_number=sequence,
+                item_id=item.id,
+                output_index=output_index,
+                delta=item.arguments,
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.output_item.done",
+            ResponseOutputItemDoneEvent(
+                sequence_number=sequence,
+                output_index=output_index,
+                item=item,
+            ),
+        )
+        sequence += 1
+
+    output_items: list[
+        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+    ] = []
+    if reasoning_item is not None:
+        output_items.append(reasoning_item)
+    if text_item is not None:
+        output_items.append(text_item)
+    output_items.extend(function_call_items)
+
+    response_object = _build_response_object(
+        request=request,
+        output_items=output_items,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        finish_reason=finish_reason,
+        response_id=response_id,
+    )
+
+    if request.store and last_output is not None:
+        persisted_messages = _responses_request_to_persisted_messages(request)
+        persisted_messages.extend(_response_output_items_to_chat_messages(output_items))
+        _responses_store[response_object.id] = {
+            "messages": copy.deepcopy(persisted_messages),
+            "response": response_object.model_copy(deep=True),
+        }
+
+    yield _responses_sse_event(
+        "response.completed",
+        ResponseCompletedEvent(sequence_number=sequence, response=response_object),
+    )
 
 
 def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
@@ -2169,17 +2588,17 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 )
 async def create_response(request: ResponsesRequest, raw_request: Request):
     """Create a Responses API response."""
+    if request.stream:
+        return StreamingResponse(
+            _disconnect_guard(_stream_responses_request(request), raw_request),
+            media_type="text/event-stream",
+        )
+
     response_object, _persisted_messages = await _run_responses_request(
         request, raw_request
     )
     if response_object is None:
         return Response(status_code=499)
-
-    if request.stream:
-        return StreamingResponse(
-            _stream_response_object(response_object),
-            media_type="text/event-stream",
-        )
 
     return response_object
 
