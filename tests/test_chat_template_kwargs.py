@@ -140,6 +140,68 @@ async def test_simple_engine_mllm_chat_forwards_chat_template_kwargs():
 
 
 @pytest.mark.anyio
+async def test_simple_engine_llm_chat_forwards_chat_template_kwargs():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+        engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._is_mllm = False
+        engine._model = MagicMock()
+        engine._model.chat = MagicMock(
+            return_value=SimpleNamespace(
+                text="OK",
+                tokens=[1],
+                finish_reason="stop",
+            )
+        )
+
+        await engine.chat(
+            [{"role": "user", "content": "Hello"}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        assert engine._model.chat.call_args.kwargs["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
+
+
+@pytest.mark.anyio
+async def test_simple_engine_tool_fallback_forwards_chat_template_kwargs():
+    from vllm_mlx.engine.simple import SimpleEngine
+
+    captured = {}
+
+    async def fake_stream_chat(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        yield SimpleNamespace(
+            text="OK",
+            tokens=[],
+            prompt_tokens=5,
+            completion_tokens=1,
+            finish_reason="stop",
+            finished=True,
+        )
+
+    with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+        engine = SimpleEngine("test-model")
+        engine._loaded = True
+        engine._is_mllm = False
+        engine._model = MagicMock()
+        engine.stream_chat = fake_stream_chat  # type: ignore[method-assign]
+
+        await engine.chat(
+            [{"role": "user", "content": "Hello"}],
+            tools=[{"type": "function", "function": {"name": "bash"}}],
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        assert captured["kwargs"]["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
+
+
+@pytest.mark.anyio
 async def test_simple_engine_stream_generate_text_applies_chat_template_kwargs():
     from vllm_mlx.engine.simple import SimpleEngine
 
