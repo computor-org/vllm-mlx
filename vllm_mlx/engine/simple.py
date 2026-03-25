@@ -437,11 +437,40 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+
+        if tools and not self._is_mllm:
+            stream_kwargs = dict(kwargs)
+            if chat_template_kwargs:
+                stream_kwargs["chat_template_kwargs"] = chat_template_kwargs
+            final_output = GenerationOutput(text="")
+            async for output in self.stream_chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                images=images,
+                videos=videos,
+                **stream_kwargs,
+            ):
+                final_output = output
+            text = clean_output_text(final_output.text)
+            return GenerationOutput(
+                text=text,
+                tokens=list(final_output.tokens),
+                prompt_tokens=final_output.prompt_tokens,
+                completion_tokens=final_output.completion_tokens,
+                finish_reason=final_output.finish_reason,
+            )
+
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
 
         async with self._generation_lock:
             if self._is_mllm:
+                if chat_template_kwargs:
+                    kwargs["chat_template_kwargs"] = chat_template_kwargs
                 # For MLLM, use the chat method which handles images/videos
                 # Run in thread pool to allow asyncio timeout to work
                 output = await asyncio.to_thread(
@@ -460,6 +489,8 @@ class SimpleEngine(BaseEngine):
                     finish_reason=output.finish_reason,
                 )
             else:
+                if chat_template_kwargs:
+                    kwargs["chat_template_kwargs"] = chat_template_kwargs
                 # For LLM, use the chat method
                 # Run in thread pool to allow asyncio timeout to work
                 output = await asyncio.to_thread(
@@ -509,6 +540,8 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+
         # Convert tools for template
         template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -519,6 +552,8 @@ class SimpleEngine(BaseEngine):
             and not _has_media_content(messages)
         ):
             logger.info("Text-only request → LLM path (MTP=True)")
+            if chat_template_kwargs:
+                kwargs["chat_template_kwargs"] = chat_template_kwargs
             async for chunk in self._stream_generate_text(
                 messages,
                 max_tokens,
@@ -543,13 +578,16 @@ class SimpleEngine(BaseEngine):
 
                 # Run stream_chat in thread pool since it's synchronous
                 def run_stream():
+                    local_kwargs = dict(kwargs)
+                    if chat_template_kwargs:
+                        local_kwargs["chat_template_kwargs"] = chat_template_kwargs
                     return list(
                         self._model.stream_chat(
                             messages=messages,
                             max_tokens=max_tokens,
                             temperature=temperature,
                             tools=template_tools,
-                            **kwargs,
+                            **local_kwargs,
                         )
                     )
 
@@ -586,6 +624,8 @@ class SimpleEngine(BaseEngine):
                 "add_generation_prompt": True,
                 "enable_thinking": enable_thinking,
             }
+            if chat_template_kwargs:
+                template_kwargs.update(chat_template_kwargs)
             if template_tools:
                 template_kwargs["tools"] = template_tools
 
@@ -593,7 +633,7 @@ class SimpleEngine(BaseEngine):
                 prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
             except TypeError:
                 # Some templates don't support all kwargs
-                for key in ["tools", "enable_thinking"]:
+                for key in ["tools", "enable_thinking", *chat_template_kwargs.keys()]:
                     if key in template_kwargs:
                         del template_kwargs[key]
                 prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
