@@ -149,6 +149,7 @@ def _install_chunked_prefill(
     from mlx_lm.generate import (
         Batch,
         _left_pad_prompts,
+        _lazy_extract_cache,
         _make_cache,
         _merge_caches,
         _right_pad_prompts,
@@ -308,6 +309,14 @@ def _install_chunked_prefill(
                 for c in prompt_cache:
                     c.finalize()
                 mx.clear_cache()
+
+                if self.prompt_checkpoint_callback is not None:
+                    self.prompt_checkpoint_callback(
+                        [
+                            (uid, prompt_checkpoint, _lazy_extract_cache(prompt_cache, i))
+                            for i, uid in enumerate(partial["uids"])
+                        ]
+                    )
 
                 if prompt_checkpoint > 1:
                     self.model(

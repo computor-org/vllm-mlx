@@ -217,18 +217,23 @@ class TestSchedulerBasic:
         return MagicMock()
 
     def test_chunked_prefill_accepts_prompt_checkpoints(self, monkeypatch):
-        """Chunked prefill must match mlx-lm's 7-field prompt tuples."""
+        """Chunked prefill must fire the checkpoint callback only on finalization."""
 
         class FakeCacheEntry:
             def empty(self):
                 return True
 
         class FakePromptCache:
-            def __init__(self):
+            def __init__(self, events):
                 self.state = mx.array([0])
+                self.events = events
 
             def finalize(self):
+                self.events.append("finalize")
                 return None
+
+            def extract(self, idx):
+                return {"idx": idx}
 
         class FakeStats:
             prompt_tokens = 0
@@ -236,7 +241,7 @@ class TestSchedulerBasic:
             generation_time = 0.0
 
         class FakeBatchGenerator:
-            def __init__(self):
+            def __init__(self, events, checkpoint_events):
                 self._stats = FakeStats()
                 self._partial = None
                 self.active_batch = None
@@ -256,12 +261,28 @@ class TestSchedulerBasic:
                 self.max_kv_size = None
                 self.stop_tokens = set()
                 self.prompt_progress_callback = lambda _progress: None
-                self.prompt_checkpoint_callback = None
+                self.prompt_checkpoint_callback = lambda payload: (
+                    events.append("checkpoint_callback"),
+                    checkpoint_events.append(payload),
+                )
                 self._next = lambda: []
                 self.remove = lambda _uids: None
                 self._process_prompts = lambda _prompts: None
-                self.model = lambda _inputs, cache=None: None
+                self.model = (
+                    lambda _inputs, cache=None: events.append(
+                        f"model:{tuple(_inputs.shape)}"
+                    )
+                    or None
+                )
+                self._step = (
+                    lambda _inputs, _cache, _samplers, _processors, _tokens: (
+                        mx.array([9]),
+                        [mx.array([0.0])],
+                    )
+                )
 
+        events = []
+        checkpoint_events = []
         monkeypatch.setattr(
             mlx_generate,
             "_left_pad_prompts",
@@ -270,18 +291,152 @@ class TestSchedulerBasic:
         monkeypatch.setattr(
             mlx_generate,
             "_make_cache",
-            lambda _model, _padding, _max_kv_size=None: [FakePromptCache()],
+            lambda _model, _padding, _max_kv_size=None: [FakePromptCache(events)],
         )
+        monkeypatch.setattr(
+            mlx_generate,
+            "_lazy_extract_cache",
+            lambda cache, idx: ("lazy", tuple(cache), idx),
+        )
+        monkeypatch.setattr(mx, "async_eval", lambda *args: None)
 
-        batch_gen = FakeBatchGenerator()
+        batch_gen = FakeBatchGenerator(events, checkpoint_events)
         _install_chunked_prefill(batch_gen, budget=4)
+        batch_gen._generation_step = lambda: []
 
-        responses = batch_gen._next()
+        first = batch_gen._next()
 
-        assert responses == []
+        assert first == []
         assert batch_gen._partial is not None
         assert batch_gen._partial["prompt_checkpoint"] == 3
         assert batch_gen._partial["processed"] == 2
+        assert checkpoint_events == []
+
+        second = batch_gen._next()
+
+        assert second == []
+        assert batch_gen._partial is None
+        assert len(checkpoint_events) == 1
+        callback_payload = checkpoint_events[0]
+        assert callback_payload[0][0] == 7
+        assert callback_payload[0][1] == 3
+        assert callback_payload[0][2][0] == "lazy"
+        assert callback_payload[0][2][2] == 0
+        assert events == [
+            "model:(1, 2)",
+            "finalize",
+            "checkpoint_callback",
+            "model:(1, 2)",
+        ]
+
+    def test_chunked_prefill_checkpoint_callback_uses_cached_tail(self, monkeypatch):
+        """Chunked prefill must fire the checkpoint callback for cached prompts too."""
+
+        class FakeCacheEntry:
+            def empty(self):
+                return False
+
+        class FakePromptCache:
+            def __init__(self, events):
+                self.state = mx.array([0])
+                self.events = events
+
+            def prepare(self, lengths, right_padding):
+                self.events.append(("prepare", tuple(lengths), tuple(right_padding)))
+
+            def finalize(self):
+                self.events.append("finalize")
+                return None
+
+            def extract(self, idx):
+                return {"idx": idx}
+
+        class FakeStats:
+            prompt_tokens = 0
+            prompt_time = 0.0
+            generation_time = 0.0
+
+        class FakeBatchGenerator:
+            def __init__(self, events, checkpoint_events):
+                self._stats = FakeStats()
+                self._partial = None
+                self.active_batch = None
+                self.unprocessed_prompts = [
+                    (
+                        7,
+                        [1, 2, 3, 4, 5],
+                        16,
+                        [FakeCacheEntry()],
+                        None,
+                        [None],
+                        2,
+                    )
+                ]
+                self.prefill_batch_size = 1
+                self.completion_batch_size = 1
+                self.max_kv_size = None
+                self.stop_tokens = set()
+                self.prompt_progress_callback = lambda _progress: None
+                self.prompt_checkpoint_callback = lambda payload: (
+                    events.append("checkpoint_callback"),
+                    checkpoint_events.append(payload),
+                )
+                self._next = lambda: []
+                self.remove = lambda _uids: None
+                self._process_prompts = lambda _prompts: None
+                self.model = (
+                    lambda _inputs, cache=None: events.append(
+                        f"model:{tuple(_inputs.shape)}"
+                    )
+                    or None
+                )
+                self._step = (
+                    lambda _inputs, _cache, _samplers, _processors, _tokens: (
+                        mx.array([9]),
+                        [mx.array([0.0])],
+                    )
+                )
+
+        events = []
+        checkpoint_events = []
+        monkeypatch.setattr(
+            mlx_generate,
+            "_right_pad_prompts",
+            lambda prompts, max_length=None: mx.array(prompts),
+        )
+        monkeypatch.setattr(
+            mlx_generate,
+            "_merge_caches",
+            lambda _caches: [FakePromptCache(events)],
+        )
+        monkeypatch.setattr(
+            mlx_generate,
+            "_lazy_extract_cache",
+            lambda cache, idx: ("lazy", tuple(cache), idx),
+        )
+        monkeypatch.setattr(mx, "async_eval", lambda *args: None)
+
+        batch_gen = FakeBatchGenerator(events, checkpoint_events)
+        _install_chunked_prefill(batch_gen, budget=4)
+        batch_gen._generation_step = lambda: []
+
+        first = batch_gen._next()
+
+        assert first == []
+        assert batch_gen._partial is not None
+        assert checkpoint_events == []
+
+        second = batch_gen._next()
+
+        assert second == []
+        assert batch_gen._partial is None
+        assert len(checkpoint_events) == 1
+        callback_payload = checkpoint_events[0]
+        assert callback_payload[0][0] == 7
+        assert callback_payload[0][1] == 3
+        assert callback_payload[0][2][0] == "lazy"
+        assert events.index("finalize") < events.index("checkpoint_callback")
+        assert any(event == "finalize" for event in events)
 
     def test_scheduler_creation(self, mock_model, mock_tokenizer):
         """Test scheduler creation."""
