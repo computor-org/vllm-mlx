@@ -8,7 +8,7 @@ integrating with vLLM's model execution system.
 
 import logging
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Any, Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +127,7 @@ class MLXLanguageModel:
         top_p: float = 0.9,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
+        logits_processors: list[Callable] | None = None,
     ) -> GenerationOutput:
         """
         Generate text from a prompt.
@@ -138,6 +139,7 @@ class MLXLanguageModel:
             top_p: Top-p (nucleus) sampling parameter
             repetition_penalty: Penalty for repeating tokens
             stop: List of stop sequences
+            logits_processors: Callables that transform logits before sampling
 
         Returns:
             GenerationOutput with generated text and tokens
@@ -150,6 +152,10 @@ class MLXLanguageModel:
         # Create sampler with parameters
         sampler = self._create_sampler(temperature, top_p)
 
+        gen_kwargs: dict[str, Any] = {}
+        if logits_processors:
+            gen_kwargs["logits_processors"] = logits_processors
+
         # Generate text
         output_text = generate(
             self.model,
@@ -158,6 +164,7 @@ class MLXLanguageModel:
             max_tokens=max_tokens,
             sampler=sampler,
             verbose=False,
+            **gen_kwargs,
         )
 
         # Tokenize output to get token IDs
@@ -180,6 +187,7 @@ class MLXLanguageModel:
         top_p: float = 0.9,
         repetition_penalty: float = 1.0,
         stop: list[str] | None = None,
+        logits_processors: list[Callable] | None = None,
     ) -> Iterator[StreamingOutput]:
         """
         Stream text generation token by token.
@@ -191,6 +199,7 @@ class MLXLanguageModel:
             top_p: Top-p (nucleus) sampling parameter
             repetition_penalty: Penalty for repeating tokens
             stop: List of stop sequences
+            logits_processors: Callables that transform logits before sampling
 
         Yields:
             StreamingOutput for each generated token
@@ -206,9 +215,11 @@ class MLXLanguageModel:
         token_count = 0
         accumulated_text = ""
 
-        mtp_kwargs = {}
+        gen_kwargs: dict[str, Any] = {}
         if self._mtp:
-            mtp_kwargs["mtp"] = True
+            gen_kwargs["mtp"] = True
+        if logits_processors:
+            gen_kwargs["logits_processors"] = logits_processors
 
         for response in stream_generate(
             self.model,
@@ -216,7 +227,7 @@ class MLXLanguageModel:
             prompt=prompt,
             max_tokens=max_tokens,
             sampler=sampler,
-            **mtp_kwargs,
+            **gen_kwargs,
         ):
             token_count += 1
             # response.text is the new token text (not accumulated)
