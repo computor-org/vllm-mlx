@@ -51,6 +51,7 @@ import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator
 
+import jsonschema
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
@@ -89,6 +90,7 @@ from .api.models import (
     ModelInfo,  # noqa: F401
     ModelsResponse,
     ToolCall,
+    ToolDefinition,
     Usage,  # noqa: F401
     VideoUrl,  # noqa: F401
 )
@@ -506,6 +508,55 @@ def _apply_tool_choice(
 
     # "auto" or None — no changes needed
     return True
+
+
+def _validate_tool_calls(
+    tool_calls: list | None,
+    tools: list | None,
+) -> list | None:
+    """Remove tool calls with unknown names or invalid arguments.
+
+    Validates each parsed tool call against the declared tools:
+    1. Function name must exist in the tools list.
+    2. Arguments must be valid JSON.
+    3. Arguments must conform to the tool's parameters schema (if declared).
+
+    Invalid tool calls are dropped with a warning log.
+    Returns None if all tool calls are invalid.
+    """
+    if not tool_calls or not tools:
+        return tool_calls or None
+
+    # Build lookup: function name -> parameters schema
+    tools_by_name: dict[str, dict | None] = {}
+    for t in tools:
+        func = (
+            t.function
+            if isinstance(t, ToolDefinition)
+            else (t.get("function") if isinstance(t, dict) else None)
+        )
+        if func and isinstance(func, dict):
+            tools_by_name[func["name"]] = func.get("parameters")
+
+    valid = []
+    for tc in tool_calls:
+        name = tc.function.name
+        if name not in tools_by_name:
+            logger.warning("Dropping tool call with unknown function: %s", name)
+            continue
+        schema = tools_by_name[name]
+        if schema:
+            try:
+                args = json.loads(tc.function.arguments)
+                jsonschema.validate(args, schema)
+            except (json.JSONDecodeError, jsonschema.ValidationError) as exc:
+                logger.warning(
+                    "Dropping tool call %s: invalid arguments: %s", name, exc
+                )
+                continue
+        valid.append(tc)
+
+    return valid or None
 
 
 def _new_response_item_id(prefix: str) -> str:
@@ -958,6 +1009,8 @@ async def _run_responses_request(
         cleaned_text, tool_calls = _parse_tool_calls_with_parser(
             output.text, chat_request
         )
+        if tool_calls:
+            tool_calls = _validate_tool_calls(tool_calls, chat_request.tools)
     else:
         cleaned_text, tool_calls = output.text, None
     reasoning_text = None
@@ -1232,6 +1285,8 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         cleaned_text, tool_calls = _parse_tool_calls_with_parser(
             raw_accumulated_text, chat_request
         )
+        if tool_calls:
+            tool_calls = _validate_tool_calls(tool_calls, chat_request.tools)
     else:
         cleaned_text, tool_calls = raw_accumulated_text, None
     final_text = accumulated_text
@@ -2448,6 +2503,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Parse tool calls from output using configured parser
     if should_parse_tools:
         cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
+        if tool_calls:
+            tool_calls = _validate_tool_calls(tool_calls, request.tools)
     else:
         cleaned_text, tool_calls = output.text, None
 
@@ -2645,6 +2702,8 @@ async def create_anthropic_message(
         cleaned_text, tool_calls = _parse_tool_calls_with_parser(
             output.text, openai_request
         )
+        if tool_calls:
+            tool_calls = _validate_tool_calls(tool_calls, openai_request.tools)
     else:
         cleaned_text, tool_calls = output.text, None
 
@@ -2842,6 +2901,8 @@ async def _stream_anthropic_messages(
         _, tool_calls = _parse_tool_calls_with_parser(
             accumulated_text, openai_request
         )
+        if tool_calls:
+            tool_calls = _validate_tool_calls(tool_calls, openai_request.tools)
     else:
         tool_calls = None
 
@@ -3135,6 +3196,21 @@ async def stream_chat_completion(
     ):
         result = tool_parser.extract_tool_calls(tool_accumulated_text)
         if result.tools_called:
+            # Convert raw dicts to ToolCall objects for validation
+            fallback_tool_calls = [
+                ToolCall(
+                    id=tc["id"],
+                    type="function",
+                    function=FunctionCall(
+                        name=tc["name"], arguments=tc["arguments"]
+                    ),
+                )
+                for tc in result.tool_calls
+            ]
+            fallback_tool_calls = _validate_tool_calls(
+                fallback_tool_calls, request.tools
+            )
+        if result.tools_called and fallback_tool_calls:
             tool_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=_model_name,
@@ -3144,14 +3220,14 @@ async def stream_chat_completion(
                             tool_calls=[
                                 {
                                     "index": i,
-                                    "id": tc["id"],
+                                    "id": tc.id,
                                     "type": "function",
                                     "function": {
-                                        "name": tc["name"],
-                                        "arguments": tc["arguments"],
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
                                     },
                                 }
-                                for i, tc in enumerate(result.tool_calls)
+                                for i, tc in enumerate(fallback_tool_calls)
                             ]
                         ),
                         finish_reason="tool_calls",
