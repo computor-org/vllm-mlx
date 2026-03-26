@@ -1596,6 +1596,16 @@ def load_model(
     if _engine.preserve_native_tool_format:
         logger.info(f"Native tool format enabled for parser: {_tool_call_parser}")
 
+    # Initialize grammar-constrained decoding (Outlines) if the engine
+    # exposes a raw model and tokenizer (SimpleEngine only for now).
+    if hasattr(_engine, "_model") and _engine._model is not None:
+        raw_model = getattr(_engine._model, "model", None)
+        raw_tokenizer = getattr(_engine._model, "tokenizer", None)
+        if raw_model is not None and raw_tokenizer is not None:
+            from .guided_decoding import init_guided_decoding
+
+            init_guided_decoding(raw_model, raw_tokenizer)
+
     logger.info(f"Default max tokens: {_default_max_tokens}")
 
 
@@ -2440,6 +2450,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             # Inject JSON instruction into messages
             messages = _inject_json_instruction(messages, json_instruction)
 
+    # Build guided-decoding logits processor when a JSON schema is provided.
+    # Falls back to prompt injection + post-hoc validation when unavailable.
+    guided_processor = _build_guided_processor(response_format)
+
     # Prepare kwargs
     chat_kwargs = {
         "max_tokens": request.max_tokens or _default_max_tokens,
@@ -2470,6 +2484,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     should_parse_tools = _apply_tool_choice(
         request.tool_choice, chat_kwargs, messages
     )
+
+    if guided_processor is not None:
+        chat_kwargs["logits_processors"] = [guided_processor]
 
     if request.stream:
         return StreamingResponse(
@@ -2572,6 +2589,45 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
         return Response(status_code=499)
 
     return response_object
+
+
+def _build_guided_processor(response_format):
+    """Extract a JSON schema from response_format and build a logits processor.
+
+    Returns None when guided decoding is unavailable or the format does not
+    contain a ``json_schema`` with an embedded ``schema``.
+    """
+    if not response_format:
+        return None
+
+    from .guided_decoding import build_json_schema_processor, is_available
+
+    if not is_available():
+        return None
+
+    # Normalize to dict
+    if hasattr(response_format, "model_dump"):
+        rf = response_format.model_dump(by_alias=True)
+    elif isinstance(response_format, dict):
+        rf = response_format
+    else:
+        return None
+
+    if rf.get("type") != "json_schema":
+        return None
+
+    js = rf.get("json_schema")
+    if not isinstance(js, dict):
+        return None
+
+    schema = js.get("schema")
+    if schema is None:
+        return None
+
+    processor = build_json_schema_processor(schema)
+    if processor is not None:
+        logger.info("Guided decoding: using Outlines logits processor for JSON schema")
+    return processor
 
 
 def _inject_json_instruction(messages: list, instruction: str) -> list:

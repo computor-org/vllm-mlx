@@ -880,6 +880,7 @@ class SimpleEngine(BaseEngine):
         specprefill_override = kwargs.pop("specprefill", None)
         specprefill_keep_pct = kwargs.pop("specprefill_keep_pct", None)
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+        logits_processors = kwargs.pop("logits_processors", None)
 
         # Read enable_thinking from env (set by runtime_patches, consistent with MLLM path)
         enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
@@ -1103,6 +1104,12 @@ class SimpleEngine(BaseEngine):
                 )
 
             # --- SpecPrefill path (with fallback to normal on failure) ---
+            if use_specprefill and logits_processors:
+                logger.warning(
+                    "SpecPrefill does not support logits_processors; "
+                    "using normal MTP path"
+                )
+                use_specprefill = False
             if use_specprefill:
                 try:
                     return _run_specprefill(model, backbone_cache)
@@ -1134,6 +1141,8 @@ class SimpleEngine(BaseEngine):
             )
             if prompt_cache is not None:
                 gen_kwargs["prompt_cache"] = prompt_cache
+            if logits_processors:
+                gen_kwargs["logits_processors"] = logits_processors
 
             for resp in mlx_stream_generate(
                 model,

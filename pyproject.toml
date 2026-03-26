@@ -78,6 +78,9 @@ vision = [
     "torchvision>=0.18.0",
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
+guided = [
+    "outlines>=1.2.0",
+]
 audio = [
     "mlx-audio>=0.2.9",
     "sounddevice>=0.4.0",
