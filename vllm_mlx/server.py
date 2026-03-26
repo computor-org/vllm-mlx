@@ -524,8 +524,10 @@ def _validate_tool_calls(
     Invalid tool calls are dropped with a warning log.
     Returns None if all tool calls are invalid.
     """
-    if not tool_calls or not tools:
-        return tool_calls or None
+    if not tool_calls:
+        return None
+    if tools is None:
+        return tool_calls
 
     # Build lookup: function name -> parameters schema
     tools_by_name: dict[str, dict | None] = {}

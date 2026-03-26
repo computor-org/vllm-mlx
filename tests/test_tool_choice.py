@@ -406,6 +406,12 @@ class TestToolCallValidation:
         result = srv._validate_tool_calls(None, tools)
         assert result is None
 
+    def test_empty_tools_list_drops_all(self):
+        """Empty tools list means no declared tools; all calls dropped."""
+        tc = self._make_tool_call("get_weather", '{"city": "NYC"}')
+        result = srv._validate_tool_calls([tc], [])
+        assert result is None
+
     def test_dict_tool_definition_supported(self):
         """Raw dict tool definitions (not ToolDefinition objects) also work."""
         tc = self._make_tool_call("get_weather", '{"city": "NYC"}')
