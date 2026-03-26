@@ -538,7 +538,9 @@ def _validate_tool_calls(
             else (t.get("function") if isinstance(t, dict) else None)
         )
         if func and isinstance(func, dict):
-            tools_by_name[func["name"]] = func.get("parameters")
+            fname = func.get("name")
+            if fname:
+                tools_by_name[fname] = func.get("parameters")
 
     valid = []
     for tc in tool_calls:
@@ -551,7 +553,7 @@ def _validate_tool_calls(
             try:
                 args = json.loads(tc.function.arguments)
                 jsonschema.validate(args, schema)
-            except (json.JSONDecodeError, jsonschema.ValidationError) as exc:
+            except (json.JSONDecodeError, jsonschema.ValidationError, jsonschema.SchemaError) as exc:
                 logger.warning(
                     "Dropping tool call %s: invalid arguments: %s", name, exc
                 )

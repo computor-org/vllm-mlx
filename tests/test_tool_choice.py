@@ -431,6 +431,25 @@ class TestToolCallValidation:
         assert result is not None
         assert len(result) == 1
 
+    def test_malformed_tool_definition_skipped(self):
+        """Tool def dict missing 'name' key doesn't crash."""
+        tc = self._make_tool_call("get_weather", '{"city": "NYC"}')
+        tools = [
+            {"type": "function", "function": {"description": "no name field"}},
+            self._make_tool_def("get_weather"),
+        ]
+        result = srv._validate_tool_calls([tc], tools)
+        assert result is not None
+        assert len(result) == 1
+
+    def test_malformed_schema_drops_tool_call(self):
+        """Tool with invalid JSON Schema drops the call instead of crashing."""
+        tc = self._make_tool_call("bad_schema", '{"x": 1}')
+        bad_schema = {"type": "object", "properties": {"x": {"type": "nonexistent_type"}}}
+        tools = [self._make_tool_def("bad_schema", bad_schema)]
+        result = srv._validate_tool_calls([tc], tools)
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # Integration test: invalid tool calls removed from API response
