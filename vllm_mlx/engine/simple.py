@@ -240,7 +240,7 @@ class SimpleEngine(BaseEngine):
             except asyncio.CancelledError:
                 try:
                     await task
-                except Exception:
+                except BaseException:
                     pass
                 raise
 
