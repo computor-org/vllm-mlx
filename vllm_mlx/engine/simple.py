@@ -240,7 +240,7 @@ class SimpleEngine(BaseEngine):
             except asyncio.CancelledError:
                 try:
                     await task
-                except Exception:
+                except BaseException:
                     pass
                 raise
 
@@ -646,6 +646,117 @@ class SimpleEngine(BaseEngine):
         tokenizer = self._model.tokenizer
         n_tokens = len(tokens)
 
+        def _run_specprefill():
+            """Score tokens, sparse prefill, generate autoregressively."""
+            import time
+            from types import SimpleNamespace
+
+            from ..specprefill import (
+                cleanup_rope,
+                score_tokens,
+                select_chunks,
+                sparse_prefill,
+            )
+
+            cache = make_prompt_cache(model)
+
+            try:
+                # Phase 1: Score with draft model
+                t0 = time.monotonic()
+                importance = score_tokens(
+                    self._draft_model,
+                    tokens,
+                    prefill_step_size=self._prefill_step_size,
+                )
+                t_score = time.monotonic() - t0
+
+                # Phase 2: Select important chunks
+                effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
+                selected = select_chunks(importance, keep_pct=effective_keep)
+                n_selected = selected.shape[0]
+
+                # Phase 3: Sparse prefill on target model
+                t0 = time.monotonic()
+                logits = sparse_prefill(
+                    model,
+                    tokens,
+                    selected,
+                    cache,
+                    step_size=self._prefill_step_size,
+                )
+                t_prefill = time.monotonic() - t0
+
+                logger.info(
+                    "SpecPrefill: scored %d tokens in %.1fs, "
+                    "sparse prefill %d/%d (keep=%.0f%%) in %.1fs",
+                    n_tokens,
+                    t_score,
+                    n_selected,
+                    n_tokens,
+                    n_selected / n_tokens * 100,
+                    t_prefill,
+                )
+
+                # Phase 4: Generate (simple autoregressive, no MTP)
+                sampler = make_sampler(temp=temperature, top_p=top_p)
+                eos_id = tokenizer.eos_token_id
+                y = sampler(logits[:, -1, :])
+                mx.eval(y)
+
+                results = []
+                generated_ids = []
+                prev_decoded = ""
+
+                for _ in range(max_tokens):
+                    tok_id = y.item()
+                    generated_ids.append(tok_id)
+
+                    decoded = tokenizer.decode(generated_ids)
+                    new_text = decoded[len(prev_decoded) :]
+                    prev_decoded = decoded
+
+                    is_eos = tok_id == eos_id
+                    results.append(
+                        SimpleNamespace(
+                            text=new_text,
+                            finish_reason="stop" if is_eos else None,
+                        )
+                    )
+
+                    if is_eos:
+                        break
+
+                    logits = model(y.reshape(1, -1), cache=cache)
+                    y = sampler(logits[:, -1, :])
+                    mx.eval(y)
+
+                return results
+
+            finally:
+                cleanup_rope(model)
+
+        def _run_normal():
+            """Fallback: normal generation without specprefill."""
+            from types import SimpleNamespace
+
+            results = []
+            for chunk in self._model.stream_generate(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                **kwargs,
+            ):
+                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                results.append(
+                    SimpleNamespace(
+                        text=new_text,
+                        finish_reason=getattr(chunk, "finish_reason", None),
+                    )
+                )
+            return results
+
         def _run_all():
             try:
                 return _run_specprefill()
@@ -654,117 +765,6 @@ class SimpleEngine(BaseEngine):
                     "SpecPrefill failed, falling back to normal path: %s", e
                 )
                 return _run_normal()
-
-            def _run_specprefill():
-                """Score tokens, sparse prefill, generate autoregressively."""
-                import time
-                from types import SimpleNamespace
-
-                from ..specprefill import (
-                    cleanup_rope,
-                    score_tokens,
-                    select_chunks,
-                    sparse_prefill,
-                )
-
-                cache = make_prompt_cache(model)
-
-                try:
-                    # Phase 1: Score with draft model
-                    t0 = time.monotonic()
-                    importance = score_tokens(
-                        self._draft_model,
-                        tokens,
-                        prefill_step_size=self._prefill_step_size,
-                    )
-                    t_score = time.monotonic() - t0
-
-                    # Phase 2: Select important chunks
-                    effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                    selected = select_chunks(importance, keep_pct=effective_keep)
-                    n_selected = selected.shape[0]
-
-                    # Phase 3: Sparse prefill on target model
-                    t0 = time.monotonic()
-                    logits = sparse_prefill(
-                        model,
-                        tokens,
-                        selected,
-                        cache,
-                        step_size=self._prefill_step_size,
-                    )
-                    t_prefill = time.monotonic() - t0
-
-                    logger.info(
-                        "SpecPrefill: scored %d tokens in %.1fs, "
-                        "sparse prefill %d/%d (keep=%.0f%%) in %.1fs",
-                        n_tokens,
-                        t_score,
-                        n_selected,
-                        n_tokens,
-                        n_selected / n_tokens * 100,
-                        t_prefill,
-                    )
-
-                    # Phase 4: Generate (simple autoregressive, no MTP)
-                    sampler = make_sampler(temp=temperature, top_p=top_p)
-                    eos_id = tokenizer.eos_token_id
-                    y = sampler(logits[:, -1, :])
-                    mx.eval(y)
-
-                    results = []
-                    generated_ids = []
-                    prev_decoded = ""
-
-                    for _ in range(max_tokens):
-                        tok_id = y.item()
-                        generated_ids.append(tok_id)
-
-                        decoded = tokenizer.decode(generated_ids)
-                        new_text = decoded[len(prev_decoded) :]
-                        prev_decoded = decoded
-
-                        is_eos = tok_id == eos_id
-                        results.append(
-                            SimpleNamespace(
-                                text=new_text,
-                                finish_reason="stop" if is_eos else None,
-                            )
-                        )
-
-                        if is_eos:
-                            break
-
-                        logits = model(y.reshape(1, -1), cache=cache)
-                        y = sampler(logits[:, -1, :])
-                        mx.eval(y)
-
-                    return results
-
-                finally:
-                    cleanup_rope(model)
-
-            def _run_normal():
-                """Fallback: normal generation without specprefill."""
-                from types import SimpleNamespace
-
-                results = []
-                for chunk in self._model.stream_generate(
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                    **kwargs,
-                ):
-                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
-                    results.append(
-                        SimpleNamespace(
-                            text=new_text,
-                            finish_reason=getattr(chunk, "finish_reason", None),
-                        )
-                    )
-                return results
 
         all_resps = await self._run_blocking_serialized(_run_all)
 
