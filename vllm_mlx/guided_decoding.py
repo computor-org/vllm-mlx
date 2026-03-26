@@ -154,8 +154,6 @@ class LazyToolCallProcessor:
         self._activation_index = 0
 
     def __call__(self, input_ids: Any, logits: Any) -> Any:
-        import mlx.core as mx
-
         last_token = input_ids[-1].item()
 
         if self._state == _INACTIVE:
