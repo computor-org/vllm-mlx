@@ -47,7 +47,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator
 
 import uvicorn
