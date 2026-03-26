@@ -1060,7 +1060,7 @@ class SimpleEngine(BaseEngine):
 
         # Run all Metal ops in a single serialized thread.
         def _run_all():
-            nonlocal backbone_cache, prompt_to_send
+            nonlocal backbone_cache, prompt_to_send, use_specprefill
 
             model = self._text_model
 

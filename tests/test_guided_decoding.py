@@ -4,9 +4,11 @@ import json
 import sys
 from unittest.mock import MagicMock, patch
 
+import mlx.core as mx
 import pytest
 
 from vllm_mlx import guided_decoding
+from vllm_mlx.guided_decoding import LazyToolCallProcessor
 
 
 @pytest.fixture(autouse=True)
@@ -288,3 +290,111 @@ class TestBuildToolCallProcessor:
         schema = json.loads(call_args)
         assert schema["properties"]["name"]["const"] == "valid"
         guided_decoding._backend = None
+
+
+# ---------------------------------------------------------------------------
+# Tests for LazyToolCallProcessor
+# ---------------------------------------------------------------------------
+
+TRIGGER = 151657
+END = 151658
+
+
+class TestLazyToolCallProcessor:
+    """Unit tests for the lazy grammar trigger wrapper."""
+
+    def _make_processor(self, prefix_skip=1):
+        inner = MagicMock()
+        inner.return_value = mx.array([0.0, 1.0, 0.0])
+        return LazyToolCallProcessor(
+            inner=inner,
+            trigger_tokens=frozenset({TRIGGER}),
+            end_tokens=frozenset({END}),
+            prefix_skip=prefix_skip,
+        ), inner
+
+    def test_inactive_passthrough(self):
+        proc, inner = self._make_processor()
+        logits = mx.array([0.5, 0.5, 0.5])
+        result = proc(mx.array([100, 200, 300]), logits)
+        assert mx.array_equal(result, logits)
+        inner.assert_not_called()
+
+    def test_activates_on_trigger_no_prefix(self):
+        proc, inner = self._make_processor(prefix_skip=0)
+        logits = mx.array([0.5, 0.5, 0.5])
+        # Trigger token: transitions to ACTIVE, but logits pass through
+        result1 = proc(mx.array([100, TRIGGER]), logits)
+        assert mx.array_equal(result1, logits)
+        # Next token: ACTIVE, inner called
+        proc(mx.array([100, TRIGGER, 4913]), logits)
+        inner.assert_called_once()
+
+    def test_deactivates_on_end_token(self):
+        proc, inner = self._make_processor(prefix_skip=0)
+        logits = mx.array([0.5, 0.5, 0.5])
+        proc(mx.array([TRIGGER]), logits)  # trigger
+        proc(mx.array([TRIGGER, 4913]), logits)  # active, inner called
+        # End token: deactivates, logits pass through
+        result = proc(mx.array([TRIGGER, 4913, END]), logits)
+        assert mx.array_equal(result, logits)
+        # Next token: inactive again
+        inner.reset_mock()
+        result = proc(mx.array([TRIGGER, 4913, END, 200]), logits)
+        assert mx.array_equal(result, logits)
+        inner.assert_not_called()
+
+    def test_rearms_after_deactivation(self):
+        proc, inner = self._make_processor(prefix_skip=0)
+        logits = mx.array([0.5, 0.5, 0.5])
+        # First tool call cycle
+        proc(mx.array([TRIGGER]), logits)
+        proc(mx.array([TRIGGER, 4913]), logits)
+        proc(mx.array([TRIGGER, 4913, END]), logits)
+        # Second trigger re-arms
+        proc(mx.array([TRIGGER, 4913, END, TRIGGER]), logits)
+        # inner.reset called at least twice (once per trigger)
+        assert inner.reset.call_count >= 2
+
+    def test_prefix_skip(self):
+        proc, inner = self._make_processor(prefix_skip=2)
+        logits = mx.array([0.5, 0.5, 0.5])
+        proc(mx.array([TRIGGER]), logits)  # trigger -> PENDING
+        proc(mx.array([TRIGGER, 198]), logits)  # prefix 1, still PENDING
+        inner.assert_not_called()
+        proc(mx.array([TRIGGER, 198, 198]), logits)  # prefix 2 -> ACTIVE
+        inner.assert_not_called()  # transition step, not yet called
+        proc(mx.array([TRIGGER, 198, 198, 4913]), logits)  # ACTIVE, inner called
+        inner.assert_called()
+
+    def test_reset_returns_to_inactive(self):
+        proc, inner = self._make_processor(prefix_skip=0)
+        logits = mx.array([0.5, 0.5, 0.5])
+        proc(mx.array([TRIGGER]), logits)  # activate
+        proc.reset()
+        # After reset, should be inactive
+        result = proc(mx.array([100, 200]), logits)
+        assert mx.array_equal(result, logits)
+        # inner.reset called by both trigger and explicit reset
+        assert inner.reset.call_count >= 1
+
+    def test_build_lazy_returns_none_without_backend(self):
+        guided_decoding._backend = None
+        result = guided_decoding.build_lazy_tool_call_processor(
+            tools=[{"function": {"name": "f"}}],
+            trigger_tokens=frozenset({TRIGGER}),
+            end_tokens=frozenset({END}),
+        )
+        assert result is None
+
+    def test_build_lazy_returns_processor_with_backend(self):
+        mock_backend = MagicMock()
+        mock_backend.get_json_schema_logits_processor.return_value = MagicMock()
+        guided_decoding._backend = mock_backend
+        result = guided_decoding.build_lazy_tool_call_processor(
+            tools=[{"function": {"name": "f", "parameters": {"type": "object"}}}],
+            trigger_tokens=frozenset({TRIGGER}),
+            end_tokens=frozenset({END}),
+            prefix_skip=1,
+        )
+        assert isinstance(result, LazyToolCallProcessor)

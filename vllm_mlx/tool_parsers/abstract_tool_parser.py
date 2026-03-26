@@ -50,6 +50,17 @@ class ToolParser(ABC):
     # without needing conversion to text format.
     SUPPORTS_NATIVE_TOOL_FORMAT: bool = False
 
+    # Token IDs that signal the start of a tool call (e.g., <tool_call>).
+    # When non-empty, enables lazy grammar activation for tool_choice=auto.
+    TRIGGER_TOKEN_IDS: frozenset[int] = frozenset()
+
+    # Token IDs that signal the end of a tool call (e.g., </tool_call>).
+    END_TOKEN_IDS: frozenset[int] = frozenset()
+
+    # Number of tokens to skip between the trigger and JSON body (e.g., a
+    # newline between <tool_call> and the opening brace).
+    PREFIX_SKIP_TOKENS: int = 0
+
     @classmethod
     def supports_native_format(cls) -> bool:
         """

@@ -37,6 +37,10 @@ class QwenToolParser(ToolParser):
     Used when --enable-auto-tool-choice --tool-call-parser qwen are set.
     """
 
+    TRIGGER_TOKEN_IDS: frozenset[int] = frozenset({151657})  # <tool_call>
+    END_TOKEN_IDS: frozenset[int] = frozenset({151658})  # </tool_call>
+    PREFIX_SKIP_TOKENS: int = 1  # \n between tag and JSON body
+
     # Pattern for XML-style: <tool_call>{"json"}</tool_call>
     XML_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
