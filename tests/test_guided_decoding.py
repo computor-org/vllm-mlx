@@ -185,3 +185,106 @@ class TestBuildGuidedProcessorHelper:
         )
         result = _build_guided_processor(rf)
         assert result is mock_processor
+
+
+# ---------------------------------------------------------------------------
+# Tests for build_tool_call_processor
+# ---------------------------------------------------------------------------
+
+
+class TestBuildToolCallProcessor:
+    """Unit tests for build_tool_call_processor()."""
+
+    def test_returns_none_without_backend(self):
+        guided_decoding._backend = None
+        result = guided_decoding.build_tool_call_processor(
+            [{"function": {"name": "f", "parameters": {"type": "object"}}}]
+        )
+        assert result is None
+
+    def test_returns_none_for_empty_tools(self):
+        guided_decoding._backend = MagicMock()
+        result = guided_decoding.build_tool_call_processor([])
+        assert result is None
+        guided_decoding._backend = None
+
+    def test_single_tool_schema(self):
+        mock_backend = MagicMock()
+        mock_processor = MagicMock()
+        mock_backend.get_json_schema_logits_processor.return_value = mock_processor
+        guided_decoding._backend = mock_backend
+
+        tools = [
+            {
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                }
+            }
+        ]
+        result = guided_decoding.build_tool_call_processor(tools)
+        assert result is mock_processor
+
+        # Verify the schema passed to the backend
+        call_args = mock_backend.get_json_schema_logits_processor.call_args[0][0]
+        schema = json.loads(call_args)
+        assert schema["properties"]["name"]["const"] == "get_weather"
+        assert schema["properties"]["arguments"]["properties"]["city"]["type"] == "string"
+        assert schema["required"] == ["name", "arguments"]
+        guided_decoding._backend = None
+
+    def test_multiple_tools_anyof(self):
+        mock_backend = MagicMock()
+        mock_backend.get_json_schema_logits_processor.return_value = MagicMock()
+        guided_decoding._backend = mock_backend
+
+        tools = [
+            {"function": {"name": "get_weather", "parameters": {"type": "object"}}},
+            {"function": {"name": "search", "parameters": {"type": "object"}}},
+        ]
+        result = guided_decoding.build_tool_call_processor(tools)
+        assert result is not None
+
+        call_args = mock_backend.get_json_schema_logits_processor.call_args[0][0]
+        schema = json.loads(call_args)
+        assert "anyOf" in schema
+        assert len(schema["anyOf"]) == 2
+        names = [s["properties"]["name"]["const"] for s in schema["anyOf"]]
+        assert "get_weather" in names
+        assert "search" in names
+        guided_decoding._backend = None
+
+    def test_tool_without_parameters(self):
+        mock_backend = MagicMock()
+        mock_backend.get_json_schema_logits_processor.return_value = MagicMock()
+        guided_decoding._backend = mock_backend
+
+        tools = [{"function": {"name": "ping"}}]
+        result = guided_decoding.build_tool_call_processor(tools)
+        assert result is not None
+
+        call_args = mock_backend.get_json_schema_logits_processor.call_args[0][0]
+        schema = json.loads(call_args)
+        assert schema["properties"]["arguments"]["type"] == "object"
+        guided_decoding._backend = None
+
+    def test_malformed_tool_skipped(self):
+        mock_backend = MagicMock()
+        mock_backend.get_json_schema_logits_processor.return_value = MagicMock()
+        guided_decoding._backend = mock_backend
+
+        tools = [
+            {"function": {"description": "no name"}},  # malformed
+            {"function": {"name": "valid"}},
+        ]
+        result = guided_decoding.build_tool_call_processor(tools)
+        assert result is not None
+
+        call_args = mock_backend.get_json_schema_logits_processor.call_args[0][0]
+        schema = json.loads(call_args)
+        assert schema["properties"]["name"]["const"] == "valid"
+        guided_decoding._backend = None

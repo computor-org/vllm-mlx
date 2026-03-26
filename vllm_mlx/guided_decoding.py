@@ -76,3 +76,41 @@ def build_regex_processor(pattern: str) -> Any:
     except Exception:
         logger.warning("Failed to build regex processor", exc_info=True)
         return None
+
+
+def build_tool_call_processor(tools: list) -> Any:
+    """Build a logits processor for tool call JSON bodies.
+
+    Creates a JSON schema matching ``{"name": "...", "arguments": {...}}``
+    where *name* is constrained to declared tool names and *arguments*
+    conform to each tool's parameter schema.  Returns None when outlines
+    is unavailable or the tools list is empty.
+    """
+    if _backend is None or not tools:
+        return None
+
+    tool_schemas = []
+    for t in tools:
+        func = t.get("function", t) if isinstance(t, dict) else getattr(t, "function", None)
+        if not func or not isinstance(func, dict):
+            continue
+        name = func.get("name")
+        if not name:
+            continue
+        params = func.get("parameters", {"type": "object"})
+        tool_schemas.append(
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "const": name},
+                    "arguments": params,
+                },
+                "required": ["name", "arguments"],
+            }
+        )
+
+    if not tool_schemas:
+        return None
+
+    schema = tool_schemas[0] if len(tool_schemas) == 1 else {"anyOf": tool_schemas}
+    return build_json_schema_processor(schema)

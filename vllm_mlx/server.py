@@ -477,6 +477,11 @@ def _apply_tool_choice(
                 ),
             }
         )
+        from .guided_decoding import build_tool_call_processor
+
+        processor = build_tool_call_processor(chat_kwargs.get("tools", []))
+        if processor:
+            chat_kwargs["logits_processors"] = [processor]
         return True
 
     if isinstance(tool_choice, dict):
@@ -498,6 +503,11 @@ def _apply_tool_choice(
                             "content": f"You MUST call the function: {fname}",
                         }
                     )
+                    from .guided_decoding import build_tool_call_processor
+
+                    processor = build_tool_call_processor(filtered)
+                    if processor:
+                        chat_kwargs["logits_processors"] = [processor]
                     return True
             # Named function not found in tools — fall back to auto
             logger.warning(

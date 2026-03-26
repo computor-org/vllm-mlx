@@ -104,6 +104,38 @@ class TestApplyToolChoice:
         assert messages[-1]["role"] == "system"
         assert "MUST call" in messages[-1]["content"]
 
+    def test_required_sets_logits_processors_when_guided_available(self):
+        from unittest.mock import MagicMock, patch
+
+        mock_processor = MagicMock()
+        chat_kwargs = {
+            "tools": [{"function": {"name": "f", "parameters": {"type": "object"}}}]
+        }
+        messages = [{"role": "user", "content": "hi"}]
+        with patch(
+            "vllm_mlx.guided_decoding.build_tool_call_processor",
+            return_value=mock_processor,
+        ):
+            srv._apply_tool_choice("required", chat_kwargs, messages)
+        assert chat_kwargs.get("logits_processors") == [mock_processor]
+
+    def test_named_function_sets_logits_processors_when_guided_available(self):
+        from unittest.mock import MagicMock, patch
+
+        mock_processor = MagicMock()
+        chat_kwargs = {
+            "tools": [{"function": {"name": "get_weather", "parameters": {"type": "object"}}}]
+        }
+        messages = [{"role": "user", "content": "hi"}]
+        with patch(
+            "vllm_mlx.guided_decoding.build_tool_call_processor",
+            return_value=mock_processor,
+        ):
+            srv._apply_tool_choice(
+                {"function": {"name": "get_weather"}}, chat_kwargs, messages
+            )
+        assert chat_kwargs.get("logits_processors") == [mock_processor]
+
     def test_dict_filters_tools_and_adds_system_message(self):
         chat_kwargs = {
             "tools": [
