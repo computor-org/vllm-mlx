@@ -448,6 +448,66 @@ def _parse_tool_calls_with_parser(
         return parse_tool_calls(output_text, request_dict)
 
 
+def _apply_tool_choice(
+    tool_choice: str | dict | None,
+    chat_kwargs: dict,
+    messages: list[dict],
+) -> bool:
+    """Apply tool_choice policy to chat kwargs and messages.
+
+    Modifies *chat_kwargs* and *messages* in place so that the chat template
+    and downstream parsing honour the caller's tool_choice setting.
+
+    Returns ``True`` when the model output should be parsed for tool calls,
+    ``False`` when tool-call parsing must be skipped (``tool_choice="none"``).
+    """
+    if tool_choice == "none":
+        chat_kwargs.pop("tools", None)
+        return False
+
+    if tool_choice == "required":
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "You MUST call one of the provided tools. "
+                    "Do not respond with plain text."
+                ),
+            }
+        )
+        return True
+
+    if isinstance(tool_choice, dict):
+        func_info = tool_choice.get("function", {})
+        fname = func_info.get("name", "") if isinstance(func_info, dict) else ""
+        if fname:
+            template_tools = chat_kwargs.get("tools")
+            if template_tools:
+                filtered = [
+                    t
+                    for t in template_tools
+                    if t.get("function", {}).get("name") == fname
+                ]
+                if filtered:
+                    chat_kwargs["tools"] = filtered
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": f"You MUST call the function: {fname}",
+                        }
+                    )
+                    return True
+            # Named function not found in tools — fall back to auto
+            logger.warning(
+                "tool_choice function %r not found in tools, falling back to auto",
+                fname,
+            )
+        return True
+
+    # "auto" or None — no changes needed
+    return True
+
+
 def _new_response_item_id(prefix: str) -> str:
     """Generate stable OpenAI-style item ids."""
     return f"{prefix}_{uuid.uuid4().hex}"
@@ -676,6 +736,15 @@ def _responses_request_to_chat_request(request: ResponsesRequest) -> ChatComplet
             detail="Responses reasoning configuration is not supported on this backend",
         )
 
+    if isinstance(request.input, list):
+        for item in request.input:
+            item_type = item.get("type") if isinstance(item, dict) else getattr(item, "type", None)
+            if item_type == "reasoning":
+                raise HTTPException(
+                    status_code=400,
+                    detail="reasoning input items are not supported on this backend",
+                )
+
     tools, unsupported_tools = _responses_tools_to_chat_tools(request.tools)
     messages = _responses_input_to_chat_messages(request)
     if unsupported_tools:
@@ -830,7 +899,7 @@ def _build_response_object(
 
 def _prepare_responses_request(
     request: ResponsesRequest,
-) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict]:
+) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict, bool]:
     """Prepare a Responses request for execution on the chat engine."""
     _validate_model_name(request.model)
     engine = get_engine()
@@ -856,12 +925,15 @@ def _prepare_responses_request(
     }
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(chat_request.tools)
+    should_parse_tools = _apply_tool_choice(
+        chat_request.tool_choice, chat_kwargs, messages
+    )
     if images:
         chat_kwargs["images"] = images
     if videos:
         chat_kwargs["videos"] = videos
 
-    return engine, chat_request, messages, chat_kwargs
+    return engine, chat_request, messages, chat_kwargs, should_parse_tools
 
 
 async def _run_responses_request(
@@ -869,7 +941,9 @@ async def _run_responses_request(
     raw_request: Request,
 ) -> tuple[ResponseObject | None, list[dict]]:
     """Execute a Responses API request against the backend chat engine."""
-    engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
+    engine, chat_request, messages, chat_kwargs, should_parse_tools = (
+        _prepare_responses_request(request)
+    )
 
     timeout = _default_timeout
     output = await _wait_with_disconnect(
@@ -880,7 +954,12 @@ async def _run_responses_request(
     if output is None:
         return None, []
 
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, chat_request)
+    if should_parse_tools:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+            output.text, chat_request
+        )
+    else:
+        cleaned_text, tool_calls = output.text, None
     reasoning_text = None
     if _reasoning_parser and not tool_calls:
         reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
@@ -915,7 +994,9 @@ async def _run_responses_request(
 
 async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[str]:
     """Execute a Responses API request and stream SSE events incrementally."""
-    engine, chat_request, messages, chat_kwargs = _prepare_responses_request(request)
+    engine, chat_request, messages, chat_kwargs, should_parse_tools = (
+        _prepare_responses_request(request)
+    )
 
     response_id = _new_response_item_id("resp")
     sequence = 1
@@ -1037,7 +1118,7 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
     tool_parser = None
     tool_accumulated_text = ""
     tool_markup_possible = False
-    if _enable_auto_tool_choice and _tool_call_parser:
+    if should_parse_tools and _enable_auto_tool_choice and _tool_call_parser:
         if _tool_parser_instance is None:
             try:
                 parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
@@ -1147,9 +1228,12 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         )
         sequence += 1
 
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-        raw_accumulated_text, chat_request
-    )
+    if should_parse_tools:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+            raw_accumulated_text, chat_request
+        )
+    else:
+        cleaned_text, tool_calls = raw_accumulated_text, None
     final_text = accumulated_text
     if cleaned_text is not None and not final_text and not tool_calls:
         final_text = clean_output_text(cleaned_text)
@@ -2324,11 +2408,20 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     # Add tools if provided
     if request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(request.tools)
+    should_parse_tools = _apply_tool_choice(
+        request.tool_choice, chat_kwargs, messages
+    )
 
     if request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                stream_chat_completion(engine, messages, request, **chat_kwargs),
+                stream_chat_completion(
+                    engine,
+                    messages,
+                    request,
+                    should_parse_tools=should_parse_tools,
+                    **chat_kwargs,
+                ),
                 raw_request,
             ),
             media_type="text/event-stream",
@@ -2353,7 +2446,10 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
     # Parse tool calls from output using configured parser
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
+    if should_parse_tools:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
+    else:
+        cleaned_text, tool_calls = output.text, None
 
     # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
     reasoning_text = None
@@ -2523,6 +2619,9 @@ async def create_anthropic_message(
 
     if openai_request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+    should_parse_tools = _apply_tool_choice(
+        openai_request.tool_choice, chat_kwargs, messages
+    )
 
     start_time = time.perf_counter()
     timeout = _default_timeout
@@ -2542,9 +2641,12 @@ async def create_anthropic_message(
     )
 
     # Parse tool calls
-    cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-        output.text, openai_request
-    )
+    if should_parse_tools:
+        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
+            output.text, openai_request
+        )
+    else:
+        cleaned_text, tool_calls = output.text, None
 
     # Clean output text
     final_content = None
@@ -2680,6 +2782,9 @@ async def _stream_anthropic_messages(
 
     if openai_request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
+    should_parse_tools = _apply_tool_choice(
+        openai_request.tool_choice, chat_kwargs, messages
+    )
 
     # Emit message_start
     message_start = {
@@ -2733,7 +2838,12 @@ async def _stream_anthropic_messages(
                 yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
     # Check for tool calls in accumulated text
-    _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
+    if should_parse_tools:
+        _, tool_calls = _parse_tool_calls_with_parser(
+            accumulated_text, openai_request
+        )
+    else:
+        tool_calls = None
 
     # Emit content_block_stop for text block
     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
@@ -2836,6 +2946,8 @@ async def stream_chat_completion(
     engine: BaseEngine,
     messages: list,
     request: ChatCompletionRequest,
+    *,
+    should_parse_tools: bool = True,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response."""
@@ -2882,7 +2994,7 @@ async def stream_chat_completion(
     tool_accumulated_text = ""
     tool_calls_detected = False
     tool_markup_possible = False  # Fast path: skip parsing until '<' seen
-    if _enable_auto_tool_choice and _tool_call_parser:
+    if should_parse_tools and _enable_auto_tool_choice and _tool_call_parser:
         # Initialize parser if needed (same as _parse_tool_calls_with_parser)
         if _tool_parser_instance is None:
             try:
