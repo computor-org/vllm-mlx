@@ -114,3 +114,90 @@ def build_tool_call_processor(tools: list) -> Any:
 
     schema = tool_schemas[0] if len(tool_schemas) == 1 else {"anyOf": tool_schemas}
     return build_json_schema_processor(schema)
+
+
+# ---------------------------------------------------------------------------
+# Lazy grammar triggers for tool_choice=auto
+# ---------------------------------------------------------------------------
+
+_INACTIVE = 0
+_PENDING = 1
+_ACTIVE = 2
+
+
+class LazyToolCallProcessor:
+    """Logits processor that activates grammar constraints lazily.
+
+    Stays inactive (passes logits through) until the model emits a trigger
+    token (e.g., ``<tool_call>``). Then activates the inner grammar-constrained
+    processor for the JSON body. Deactivates on the end token (e.g.,
+    ``</tool_call>``) and re-arms for the next tool call.
+
+    Shape contract: mlx_lm's ``generate_step`` passes 1D ``input_ids``
+    ``(seq_len,)`` and 1D ``logits`` ``(vocab_size,)``. The inner Outlines
+    processor normalizes to 2D internally via its own ``__call__``.
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        trigger_tokens: frozenset[int],
+        end_tokens: frozenset[int],
+        prefix_skip: int = 0,
+    ):
+        self._inner = inner
+        self._trigger_tokens = trigger_tokens
+        self._end_tokens = end_tokens
+        self._prefix_skip = prefix_skip
+        self._state = _INACTIVE
+        self._prefix_remaining = 0
+        self._activation_index = 0
+
+    def __call__(self, input_ids: Any, logits: Any) -> Any:
+        last_token = input_ids[-1].item()
+
+        if self._state == _INACTIVE:
+            if last_token in self._trigger_tokens:
+                self._state = _PENDING if self._prefix_skip > 0 else _ACTIVE
+                self._prefix_remaining = self._prefix_skip
+                self._inner.reset()
+                self._activation_index = len(input_ids)
+            return logits
+
+        if self._state == _PENDING:
+            self._prefix_remaining -= 1
+            if self._prefix_remaining <= 0:
+                self._state = _ACTIVE
+                self._activation_index = len(input_ids)
+            return logits
+
+        # _ACTIVE
+        if last_token in self._end_tokens:
+            self._state = _INACTIVE
+            return logits
+
+        active_ids = input_ids[self._activation_index:]
+        return self._inner(active_ids, logits)
+
+    def reset(self) -> None:
+        """Reset to inactive state for a new generation."""
+        self._state = _INACTIVE
+        self._prefix_remaining = 0
+        self._activation_index = 0
+        self._inner.reset()
+
+
+def build_lazy_tool_call_processor(
+    tools: list,
+    trigger_tokens: frozenset[int],
+    end_tokens: frozenset[int],
+    prefix_skip: int = 0,
+) -> Any:
+    """Build a lazy tool call processor that activates on trigger tokens.
+
+    Returns None when the Outlines backend is unavailable or tools are empty.
+    """
+    inner = build_tool_call_processor(tools)
+    if inner is None:
+        return None
+    return LazyToolCallProcessor(inner, trigger_tokens, end_tokens, prefix_skip)
