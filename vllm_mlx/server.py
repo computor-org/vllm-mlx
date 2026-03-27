@@ -568,11 +568,11 @@ def _apply_tool_choice(
             )
         return True
 
-    # "auto" or None — lazy grammar triggers disabled pending investigation of
-    # BatchGenerator state corruption when logits_processors are applied in
-    # INACTIVE mode (returns logits unchanged but corrupts subsequent generation).
-    # tool_choice="required" and named function modes work correctly because they
-    # use the direct grammar processor without the lazy wrapper.
+    # "auto" or None — no grammar processor applied.  Lazy grammar triggers
+    # (LazyToolCallProcessor) are disabled because BatchGenerator state is
+    # corrupted when logits_processors pass through logits unchanged in
+    # INACTIVE mode.  tool_choice="required" and named-function modes use the
+    # direct grammar processor and are unaffected.
     return True
 
 
