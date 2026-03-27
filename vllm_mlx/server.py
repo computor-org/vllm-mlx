@@ -240,6 +240,21 @@ def _get_cache_dir() -> str:
     return cache_dir
 
 
+def _init_guided_decoding_if_available():
+    """Initialize Outlines guided decoding if the engine has a loaded model."""
+    if _engine is None:
+        return
+    raw_model = getattr(_engine, "_model", None)
+    raw_tokenizer = getattr(_engine, "_tokenizer", None)
+    if raw_model is not None and hasattr(raw_model, "model"):
+        raw_tokenizer = getattr(raw_model, "tokenizer", raw_tokenizer)
+        raw_model = raw_model.model
+    if raw_model is not None and raw_tokenizer is not None:
+        from .guided_decoding import init_guided_decoding
+
+        init_guided_decoding(raw_model, raw_tokenizer)
+
+
 async def lifespan(app: FastAPI):
     """FastAPI lifespan for startup/shutdown events."""
     global _engine, _mcp_manager
@@ -247,6 +262,9 @@ async def lifespan(app: FastAPI):
     # Startup: Start engine if loaded (needed for BatchedEngine in uvicorn's event loop)
     if _engine is not None and hasattr(_engine, "_loaded") and not _engine._loaded:
         await _engine.start()
+
+    # Initialize guided decoding now that engine model is loaded
+    _init_guided_decoding_if_available()
 
     # Load persisted cache from disk (AFTER engine start — AsyncEngineCore must exist)
     if _engine is not None and hasattr(_engine, "load_cache_from_disk"):
@@ -1609,22 +1627,7 @@ def load_model(
     if _engine.preserve_native_tool_format:
         logger.info(f"Native tool format enabled for parser: {_tool_call_parser}")
 
-    # Initialize grammar-constrained decoding (Outlines) if the engine
-    # exposes a raw model and tokenizer (SimpleEngine only for now).
-    if hasattr(_engine, "_model") and _engine._model is not None:
-        # Extract raw model and tokenizer for guided decoding init.
-        # SimpleEngine wraps in MLXLanguageModel (_model.model / _model.tokenizer).
-        # BatchedEngine stores them directly (_model / _tokenizer).
-        raw_model = getattr(_engine, "_model", None)
-        raw_tokenizer = getattr(_engine, "_tokenizer", None)
-        if raw_model is not None and hasattr(raw_model, "model"):
-            # SimpleEngine's MLXLanguageModel wrapper
-            raw_tokenizer = getattr(raw_model, "tokenizer", raw_tokenizer)
-            raw_model = raw_model.model
-        if raw_model is not None and raw_tokenizer is not None:
-            from .guided_decoding import init_guided_decoding
-
-            init_guided_decoding(raw_model, raw_tokenizer)
+    _init_guided_decoding_if_available()
 
     logger.info(f"Default max tokens: {_default_max_tokens}")
 
