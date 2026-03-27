@@ -1619,7 +1619,6 @@ def load_model(
             force_mllm=force_mllm,
         )
         # BatchedEngine will be started in lifespan (uvicorn's event loop)
-        # Just log for now
         logger.info(f"Model loaded (batched mode): {model_name}")
     else:
         logger.info(f"Loading model with SimpleEngine: {model_name}")
@@ -2769,9 +2768,14 @@ async def create_anthropic_message(
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
-        "temperature": openai_request.temperature,
-        "top_p": openai_request.top_p,
+        "temperature": _resolve_temperature(openai_request.temperature),
+        "top_p": _resolve_top_p(openai_request.top_p),
     }
+
+    if images:
+        chat_kwargs["images"] = images
+    if videos:
+        chat_kwargs["videos"] = videos
 
     if openai_request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)
@@ -2929,9 +2933,14 @@ async def _stream_anthropic_messages(
 
     chat_kwargs = {
         "max_tokens": openai_request.max_tokens or _default_max_tokens,
-        "temperature": openai_request.temperature,
-        "top_p": openai_request.top_p,
+        "temperature": _resolve_temperature(openai_request.temperature),
+        "top_p": _resolve_top_p(openai_request.top_p),
     }
+
+    if images:
+        chat_kwargs["images"] = images
+    if videos:
+        chat_kwargs["videos"] = videos
 
     if openai_request.tools:
         chat_kwargs["tools"] = convert_tools_for_template(openai_request.tools)

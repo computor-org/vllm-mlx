@@ -292,7 +292,7 @@ class TestAnthropicToOpenai:
     def test_temperature_default(self):
         req = self._make_request()
         result = anthropic_to_openai(req)
-        assert result.temperature == 0.7
+        assert result.temperature is None
 
     def test_temperature_explicit(self):
         req = self._make_request(temperature=0.3)
@@ -302,7 +302,7 @@ class TestAnthropicToOpenai:
     def test_top_p_default(self):
         req = self._make_request()
         result = anthropic_to_openai(req)
-        assert result.top_p == 0.9
+        assert result.top_p is None
 
     def test_top_p_explicit(self):
         req = self._make_request(top_p=0.5)

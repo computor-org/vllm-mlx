@@ -210,8 +210,8 @@ class TestBatchingPerformance:
             )
         )
 
-        params = SamplingParams(max_tokens=10, temperature=0.0)
-        prompts = [f"Count to {i}:" for i in range(1, 5)]
+        params = SamplingParams(max_tokens=30, temperature=0.0)
+        prompts = [f"Count to {i}:" for i in range(1, 9)]
 
         async def run_sequential():
             """Run requests one at a time."""
