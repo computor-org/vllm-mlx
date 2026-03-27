@@ -536,20 +536,11 @@ def _apply_tool_choice(
             )
         return True
 
-    # "auto" or None — build lazy grammar processor when triggers are defined
-    if chat_kwargs.get("tools") and _tool_call_parser and _tool_parser_instance:
-        parser_cls = type(_tool_parser_instance)
-        if parser_cls.TRIGGER_TOKEN_IDS:
-            from .guided_decoding import build_lazy_tool_call_processor
-
-            processor = build_lazy_tool_call_processor(
-                tools=chat_kwargs.get("tools", []),
-                trigger_tokens=parser_cls.TRIGGER_TOKEN_IDS,
-                end_tokens=parser_cls.END_TOKEN_IDS,
-                prefix_skip=parser_cls.PREFIX_SKIP_TOKENS,
-            )
-            if processor:
-                chat_kwargs["logits_processors"] = [processor]
+    # "auto" or None — lazy grammar triggers disabled pending investigation of
+    # BatchGenerator state corruption when logits_processors are applied in
+    # INACTIVE mode (returns logits unchanged but corrupts subsequent generation).
+    # tool_choice="required" and named function modes work correctly because they
+    # use the direct grammar processor without the lazy wrapper.
     return True
 
 
