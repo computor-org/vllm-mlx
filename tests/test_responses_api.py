@@ -452,7 +452,8 @@ class TestResponsesEndpoint:
         assert resp.status_code == 400
         assert "json_object" in resp.json()["detail"]
 
-    def test_reasoning_configuration_is_rejected(self, client):
+    def test_reasoning_configuration_is_ignored(self, client):
+        """Unsupported reasoning config is silently ignored (200 OK)."""
         import vllm_mlx.server as srv
 
         srv._engine = _mock_engine(_output("Hello"))
@@ -466,10 +467,10 @@ class TestResponsesEndpoint:
             },
         )
 
-        assert resp.status_code == 400
-        assert "reasoning configuration" in resp.json()["detail"]
+        assert resp.status_code == 200
 
-    def test_reasoning_input_item_is_rejected(self, client):
+    def test_reasoning_input_item_is_accepted(self, client):
+        """Reasoning input items are converted to assistant messages."""
         import vllm_mlx.server as srv
 
         srv._engine = _mock_engine(_output("Hello"))
@@ -485,8 +486,7 @@ class TestResponsesEndpoint:
             },
         )
 
-        assert resp.status_code == 400
-        assert "reasoning input items are not supported" in resp.json()["detail"]
+        assert resp.status_code == 200
 
     def test_length_finish_reason_marks_response_incomplete(self, client):
         import vllm_mlx.server as srv

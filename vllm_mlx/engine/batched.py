@@ -478,6 +478,8 @@ class BatchedEngine(BaseEngine):
         # Use LLM engine for text-only (non-MLLM models)
         from ..request import SamplingParams
 
+        logits_processors = kwargs.pop("logits_processors", None)
+
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -488,6 +490,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            logits_processors=logits_processors,
         )
 
         text = clean_output_text(output.output_text)
@@ -554,6 +557,8 @@ class BatchedEngine(BaseEngine):
         # Use LLM engine for text-only
         from ..request import SamplingParams
 
+        logits_processors = kwargs.pop("logits_processors", None)
+
         sampling_params = SamplingParams(
             max_tokens=max_tokens,
             temperature=temperature,
@@ -566,6 +571,7 @@ class BatchedEngine(BaseEngine):
             prompt=prompt,
             sampling_params=sampling_params,
             prefix_boundary=prefix_boundary,
+            logits_processors=logits_processors,
         )
 
         async for output in self._engine.stream_outputs(request_id):

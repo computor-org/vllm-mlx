@@ -8,6 +8,7 @@ request management system, simplified for MLX backend.
 
 import enum
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -116,6 +117,9 @@ class Request:
     # Paged cache fields (for BlockAwarePrefixCache)
     block_table: Optional["BlockTable"] = None  # Block table for paged cache
     shared_prefix_blocks: int = 0  # Number of shared prefix blocks
+
+    # Per-request logits processors (grammar-constrained decoding)
+    logits_processors: Optional[List[Callable]] = None
 
     # Multimodal content (images, video) - raw inputs
     images: Optional[List[Any]] = None

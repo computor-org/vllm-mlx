@@ -264,6 +264,7 @@ class EngineCore:
         images: Optional[List[Any]] = None,
         videos: Optional[List[Any]] = None,
         prefix_boundary: int = 0,
+        logits_processors: Optional[list] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -275,6 +276,8 @@ class EngineCore:
             images: Optional images for multimodal
             videos: Optional videos for multimodal
             prefix_boundary: Token count for shared prefix (for cache)
+            logits_processors: Per-request logits processors for
+                grammar-constrained decoding
 
         Returns:
             The request ID
@@ -292,6 +295,7 @@ class EngineCore:
             images=images,
             videos=videos,
             prefix_boundary=prefix_boundary,
+            logits_processors=logits_processors,
         )
 
         # Setup output collector with stream_interval from config

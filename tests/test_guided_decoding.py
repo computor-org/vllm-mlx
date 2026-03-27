@@ -2,6 +2,7 @@
 
 import json
 import sys
+import unittest
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -398,3 +399,89 @@ class TestLazyToolCallProcessor:
             prefix_skip=1,
         )
         assert isinstance(result, LazyToolCallProcessor)
+
+
+# ---------------------------------------------------------------------------
+# Tests for BatchedEngine forwarding logits_processors
+# ---------------------------------------------------------------------------
+
+
+class TestBatchedEngineForwardsLogitsProcessors(unittest.IsolatedAsyncioTestCase):
+    """Verify logits_processors reach the scheduler via BatchedEngine."""
+
+    async def test_generate_forwards_logits_processors(self):
+        """BatchedEngine.generate() must pass logits_processors to the engine core."""
+        from unittest.mock import AsyncMock
+
+        from vllm_mlx.engine.batched import BatchedEngine
+        from vllm_mlx.request import RequestOutput
+
+        engine = BatchedEngine.__new__(BatchedEngine)
+        engine._loaded = True
+        engine._is_mllm = False
+        engine._mllm_scheduler = None
+
+        mock_core = AsyncMock()
+        mock_core.generate.return_value = RequestOutput(
+            request_id="r1",
+            output_text="ok",
+            finished=True,
+            prompt_tokens=5,
+            completion_tokens=2,
+            finish_reason="stop",
+        )
+        engine._engine = mock_core
+
+        fake_processor = MagicMock()
+        await engine.generate(
+            prompt="hello",
+            max_tokens=10,
+            logits_processors=[fake_processor],
+        )
+
+        mock_core.generate.assert_called_once()
+        call_kwargs = mock_core.generate.call_args
+        assert call_kwargs.kwargs.get("logits_processors") == [fake_processor]
+
+    async def test_stream_generate_forwards_logits_processors(self):
+        """BatchedEngine.stream_generate() must pass logits_processors to add_request."""
+        from unittest.mock import AsyncMock
+
+        from vllm_mlx.engine.batched import BatchedEngine
+        from vllm_mlx.request import RequestOutput
+
+        engine = BatchedEngine.__new__(BatchedEngine)
+        engine._loaded = True
+        engine._is_mllm = False
+        engine._mllm_scheduler = None
+
+        mock_core = AsyncMock()
+        mock_core.add_request.return_value = "req-1"
+
+        async def _stream(request_id, timeout=None):
+            yield RequestOutput(
+                request_id="req-1",
+                output_text="ok",
+                new_text="ok",
+                finished=True,
+                prompt_tokens=5,
+                completion_tokens=2,
+                finish_reason="stop",
+            )
+
+        mock_core.stream_outputs = _stream
+        engine._engine = mock_core
+
+        fake_processor = MagicMock()
+        chunks = []
+        async for chunk in engine.stream_generate(
+            prompt="hello",
+            max_tokens=10,
+            logits_processors=[fake_processor],
+        ):
+            chunks.append(chunk)
+
+        mock_core.add_request.assert_called_once()
+        call_kwargs = mock_core.add_request.call_args
+        assert call_kwargs.kwargs.get("logits_processors") == [fake_processor]
+        assert len(chunks) == 1
