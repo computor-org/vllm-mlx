@@ -175,6 +175,35 @@ class TestApplyToolChoice:
         assert "tools" in chat_kwargs
         assert len(messages) == 1
 
+    def test_auto_sets_lazy_processor_when_triggers_defined(self):
+        from unittest.mock import MagicMock, PropertyMock, patch
+
+        mock_processor = MagicMock()
+        chat_kwargs = {
+            "tools": [{"function": {"name": "f", "parameters": {"type": "object"}}}]
+        }
+        messages = [{"role": "user", "content": "hi"}]
+
+        mock_parser = MagicMock()
+        type(mock_parser).TRIGGER_TOKEN_IDS = PropertyMock(
+            return_value=frozenset({151657})
+        )
+        type(mock_parser).END_TOKEN_IDS = PropertyMock(
+            return_value=frozenset({151658})
+        )
+        type(mock_parser).PREFIX_SKIP_TOKENS = PropertyMock(return_value=1)
+
+        with patch.object(srv, "_tool_call_parser", "qwen"), \
+             patch.object(srv, "_tool_parser_instance", mock_parser), \
+             patch(
+                 "vllm_mlx.guided_decoding.build_lazy_tool_call_processor",
+                 return_value=mock_processor,
+             ):
+            result = srv._apply_tool_choice("auto", chat_kwargs, messages)
+
+        assert result is True
+        assert chat_kwargs.get("logits_processors") == [mock_processor]
+
     def test_none_value_returns_true_no_changes(self):
         chat_kwargs = {"tools": [{"function": {"name": "f"}}]}
         messages = [{"role": "user", "content": "hi"}]

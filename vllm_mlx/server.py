@@ -243,17 +243,11 @@ def _get_cache_dir() -> str:
 def _init_guided_decoding_if_available():
     """Initialize Outlines guided decoding if the engine has a loaded model.
 
-    Only supported with SimpleEngine. BatchedEngine output is corrupted
-    when Outlines' MLXLM vocabulary extraction touches the shared
-    tokenizer/model state (shallow copy via copy.copy is not sufficient).
-    The BatchedEngine logits_processors plumbing is in place and will
-    work once the Outlines init isolation issue is resolved upstream.
+    Works with both SimpleEngine and BatchedEngine.  SimpleEngine wraps the
+    model in MLXLanguageModel (``_model.model``), BatchedEngine stores it
+    directly (``_model``).
     """
     if _engine is None:
-        return
-    from .engine.simple import SimpleEngine
-
-    if not isinstance(_engine, SimpleEngine):
         return
     raw_model = getattr(_engine, "_model", None)
     raw_tokenizer = getattr(_engine, "_tokenizer", None)
@@ -569,11 +563,22 @@ def _apply_tool_choice(
             )
         return True
 
-    # "auto" or None — no grammar processor applied.  Lazy grammar triggers
-    # (LazyToolCallProcessor) are disabled because BatchGenerator state is
-    # corrupted when logits_processors pass through logits unchanged in
-    # INACTIVE mode.  tool_choice="required" and named-function modes use the
-    # direct grammar processor and are unaffected.
+    # "auto" or None — apply lazy grammar trigger when the parser defines one.
+    # The processor stays inactive until the model emits a tool call trigger
+    # token, then constrains the JSON body to match the tool schemas.
+    if chat_kwargs.get("tools") and _tool_call_parser and _tool_parser_instance:
+        parser_cls = type(_tool_parser_instance)
+        if parser_cls.TRIGGER_TOKEN_IDS:
+            from .guided_decoding import build_lazy_tool_call_processor
+
+            processor = build_lazy_tool_call_processor(
+                tools=chat_kwargs.get("tools", []),
+                trigger_tokens=parser_cls.TRIGGER_TOKEN_IDS,
+                end_tokens=parser_cls.END_TOKEN_IDS,
+                prefix_skip=parser_cls.PREFIX_SKIP_TOKENS,
+            )
+            if processor:
+                chat_kwargs["logits_processors"] = [processor]
     return True
 
 
