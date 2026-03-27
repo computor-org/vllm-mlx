@@ -1799,11 +1799,17 @@ class Scheduler:
             # Wrap in try/except: if cache shapes are incompatible
             # (e.g. stale entry after BatchGenerator recreation),
             # fall back to no-cache insert instead of crashing.
+            # Per-request logits processors for grammar-constrained decoding
+            lp_arg = (
+                [request.logits_processors] if request.logits_processors else None
+            )
+
             try:
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
                     max_tokens=[request.sampling_params.max_tokens],
                     caches=[cache_to_use] if cache_to_use else None,
+                    logits_processors=lp_arg,
                 )
             except Exception as e:
                 if cache_to_use is not None:
@@ -1820,6 +1826,7 @@ class Scheduler:
                         [tokens_to_process],
                         max_tokens=[request.sampling_params.max_tokens],
                         caches=None,
+                        logits_processors=lp_arg,
                     )
                 else:
                     raise

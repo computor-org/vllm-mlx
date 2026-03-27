@@ -101,8 +101,8 @@ class TestApplyToolChoice:
         result = srv._apply_tool_choice("required", chat_kwargs, messages)
         assert result is True
         assert len(messages) == 2
-        assert messages[-1]["role"] == "system"
-        assert "MUST call" in messages[-1]["content"]
+        assert messages[0]["role"] == "system"
+        assert "MUST call" in messages[0]["content"]
 
     def test_required_sets_logits_processors_when_guided_available(self):
         from unittest.mock import MagicMock, patch
@@ -151,7 +151,7 @@ class TestApplyToolChoice:
         assert len(chat_kwargs["tools"]) == 1
         assert chat_kwargs["tools"][0]["function"]["name"] == "get_weather"
         assert len(messages) == 2
-        assert "get_weather" in messages[-1]["content"]
+        assert "get_weather" in messages[0]["content"]
 
     def test_dict_with_no_matching_tool_falls_back_to_auto(self):
         chat_kwargs = {
