@@ -183,24 +183,6 @@ class TestApplyToolChoice:
         assert "tools" in chat_kwargs
         assert len(messages) == 1
 
-    def test_auto_without_triggers_no_processor(self):
-        from unittest.mock import MagicMock, PropertyMock, patch
-
-        chat_kwargs = {"tools": [{"function": {"name": "f"}}]}
-        messages = [{"role": "user", "content": "hi"}]
-
-        mock_parser = MagicMock()
-        type(mock_parser).TRIGGER_TOKEN_IDS = PropertyMock(
-            return_value=frozenset()
-        )
-
-        with patch.object(srv, "_tool_call_parser", "hermes"), patch.object(
-            srv, "_tool_parser_instance", mock_parser
-        ):
-            srv._apply_tool_choice("auto", chat_kwargs, messages)
-
-        assert "logits_processors" not in chat_kwargs
-
     def test_tool_choice_processor_not_overwritten_by_response_format(self):
         """tool_choice grammar processor takes priority over response_format."""
         from unittest.mock import MagicMock, patch

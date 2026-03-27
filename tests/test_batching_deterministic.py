@@ -264,11 +264,9 @@ class TestBatchingPerformance:
         print(f"Batched: {batch_throughput:.1f} tok/s")
         print(f"Speedup: {batch_throughput/seq_throughput:.2f}x")
 
-        # Batched throughput should not regress catastrophically vs sequential.
-        # On small workloads the batching overhead may dominate, so we allow
-        # batched to be up to 40% slower and still pass.
-        assert batch_throughput > seq_throughput * 0.6, (
-            f"Batched ({batch_throughput:.1f} tok/s) regressed too far vs "
+        # Batched should have better throughput (allow 10% tolerance for variance)
+        assert batch_throughput > seq_throughput * 0.9, (
+            f"Batched ({batch_throughput:.1f} tok/s) should be faster than "
             f"sequential ({seq_throughput:.1f} tok/s)"
         )
 

@@ -243,10 +243,11 @@ def _get_cache_dir() -> str:
 def _init_guided_decoding_if_available():
     """Initialize Outlines guided decoding if the engine has a loaded model.
 
-    Only supported with SimpleEngine. BatchedEngine's model state is
-    corrupted by Outlines' MLXLM vocabulary extraction (produces garbage
-    output). The BatchedEngine logits_processors plumbing is in place
-    and will work once this init issue is resolved upstream.
+    Only supported with SimpleEngine. BatchedEngine output is corrupted
+    when Outlines' MLXLM vocabulary extraction touches the shared
+    tokenizer/model state (shallow copy via copy.copy is not sufficient).
+    The BatchedEngine logits_processors plumbing is in place and will
+    work once the Outlines init isolation issue is resolved upstream.
     """
     if _engine is None:
         return
