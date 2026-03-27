@@ -1612,8 +1612,15 @@ def load_model(
     # Initialize grammar-constrained decoding (Outlines) if the engine
     # exposes a raw model and tokenizer (SimpleEngine only for now).
     if hasattr(_engine, "_model") and _engine._model is not None:
-        raw_model = getattr(_engine._model, "model", None)
-        raw_tokenizer = getattr(_engine._model, "tokenizer", None)
+        # Extract raw model and tokenizer for guided decoding init.
+        # SimpleEngine wraps in MLXLanguageModel (_model.model / _model.tokenizer).
+        # BatchedEngine stores them directly (_model / _tokenizer).
+        raw_model = getattr(_engine, "_model", None)
+        raw_tokenizer = getattr(_engine, "_tokenizer", None)
+        if raw_model is not None and hasattr(raw_model, "model"):
+            # SimpleEngine's MLXLanguageModel wrapper
+            raw_tokenizer = getattr(raw_model, "tokenizer", raw_tokenizer)
+            raw_model = raw_model.model
         if raw_model is not None and raw_tokenizer is not None:
             from .guided_decoding import init_guided_decoding
 
