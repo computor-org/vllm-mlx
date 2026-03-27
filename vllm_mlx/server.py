@@ -243,10 +243,11 @@ def _get_cache_dir() -> str:
 def _init_guided_decoding_if_available():
     """Initialize Outlines guided decoding if the engine has a loaded model.
 
-    Only supported with SimpleEngine. BatchedEngine's model state is
-    corrupted by Outlines' MLXLM vocabulary extraction (produces garbage
-    output). The BatchedEngine logits_processors plumbing is in place
-    and will work once this init issue is resolved upstream.
+    Only supported with SimpleEngine. BatchedEngine output is corrupted
+    when Outlines' MLXLM vocabulary extraction touches the shared
+    tokenizer/model state (shallow copy via copy.copy is not sufficient).
+    The BatchedEngine logits_processors plumbing is in place and will
+    work once the Outlines init isolation issue is resolved upstream.
     """
     if _engine is None:
         return
@@ -478,6 +479,36 @@ def _parse_tool_calls_with_parser(
         return parse_tool_calls(output_text, request_dict)
 
 
+def _parse_and_validate_tools(
+    output_text: str,
+    request: ChatCompletionRequest,
+    should_parse: bool,
+) -> tuple[str, list | None]:
+    """Parse tool calls from model output and validate against declared tools.
+
+    When *should_parse* is False (tool_choice="none"), returns the raw text
+    with no tool calls.
+    """
+    if not should_parse:
+        return output_text, None
+    cleaned, tool_calls = _parse_tool_calls_with_parser(output_text, request)
+    if tool_calls:
+        tool_calls = _validate_tool_calls(tool_calls, request.tools)
+    return cleaned, tool_calls
+
+
+def _set_tool_grammar_processor(chat_kwargs: dict, tools: list) -> None:
+    """Attach an Outlines grammar-constrained logits processor for tool calls.
+
+    Modifies *chat_kwargs* in place. Does nothing when Outlines is unavailable.
+    """
+    from .guided_decoding import build_tool_call_processor
+
+    processor = build_tool_call_processor(tools)
+    if processor:
+        chat_kwargs["logits_processors"] = [processor]
+
+
 def _apply_tool_choice(
     tool_choice: str | dict | None,
     chat_kwargs: dict,
@@ -506,11 +537,7 @@ def _apply_tool_choice(
                 ),
             },
         )
-        from .guided_decoding import build_tool_call_processor
-
-        processor = build_tool_call_processor(chat_kwargs.get("tools", []))
-        if processor:
-            chat_kwargs["logits_processors"] = [processor]
+        _set_tool_grammar_processor(chat_kwargs, chat_kwargs.get("tools", []))
         return True
 
     if isinstance(tool_choice, dict):
@@ -533,11 +560,7 @@ def _apply_tool_choice(
                             "content": f"You MUST call the function: {fname}",
                         },
                     )
-                    from .guided_decoding import build_tool_call_processor
-
-                    processor = build_tool_call_processor(filtered)
-                    if processor:
-                        chat_kwargs["logits_processors"] = [processor]
+                    _set_tool_grammar_processor(chat_kwargs, filtered)
                     return True
             # Named function not found in tools — fall back to auto
             logger.warning(
@@ -546,11 +569,11 @@ def _apply_tool_choice(
             )
         return True
 
-    # "auto" or None — lazy grammar triggers disabled pending investigation of
-    # BatchGenerator state corruption when logits_processors are applied in
-    # INACTIVE mode (returns logits unchanged but corrupts subsequent generation).
-    # tool_choice="required" and named function modes work correctly because they
-    # use the direct grammar processor without the lazy wrapper.
+    # "auto" or None — no grammar processor applied.  Lazy grammar triggers
+    # (LazyToolCallProcessor) are disabled because BatchGenerator state is
+    # corrupted when logits_processors pass through logits unchanged in
+    # INACTIVE mode.  tool_choice="required" and named-function modes use the
+    # direct grammar processor and are unaffected.
     return True
 
 
@@ -1041,14 +1064,9 @@ async def _run_responses_request(
     if output is None:
         return None, []
 
-    if should_parse_tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-            output.text, chat_request
-        )
-        if tool_calls:
-            tool_calls = _validate_tool_calls(tool_calls, chat_request.tools)
-    else:
-        cleaned_text, tool_calls = output.text, None
+    cleaned_text, tool_calls = _parse_and_validate_tools(
+        output.text, chat_request, should_parse_tools
+    )
     reasoning_text = None
     if _reasoning_parser and not tool_calls:
         reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
@@ -1317,14 +1335,9 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         )
         sequence += 1
 
-    if should_parse_tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-            raw_accumulated_text, chat_request
-        )
-        if tool_calls:
-            tool_calls = _validate_tool_calls(tool_calls, chat_request.tools)
-    else:
-        cleaned_text, tool_calls = raw_accumulated_text, None
+    cleaned_text, tool_calls = _parse_and_validate_tools(
+        raw_accumulated_text, chat_request, should_parse_tools
+    )
     final_text = accumulated_text
     if cleaned_text is not None and not final_text and not tool_calls:
         final_text = clean_output_text(cleaned_text)
@@ -2509,7 +2522,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         request.tool_choice, chat_kwargs, messages
     )
 
-    if guided_processor is not None:
+    if guided_processor is not None and "logits_processors" not in chat_kwargs:
         chat_kwargs["logits_processors"] = [guided_processor]
 
     if request.stream:
@@ -2546,12 +2559,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
     # Parse tool calls from output using configured parser
-    if should_parse_tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
-        if tool_calls:
-            tool_calls = _validate_tool_calls(tool_calls, request.tools)
-    else:
-        cleaned_text, tool_calls = output.text, None
+    cleaned_text, tool_calls = _parse_and_validate_tools(
+        output.text, request, should_parse_tools
+    )
 
     # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
     reasoning_text = None
@@ -2782,14 +2792,9 @@ async def create_anthropic_message(
     )
 
     # Parse tool calls
-    if should_parse_tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-            output.text, openai_request
-        )
-        if tool_calls:
-            tool_calls = _validate_tool_calls(tool_calls, openai_request.tools)
-    else:
-        cleaned_text, tool_calls = output.text, None
+    cleaned_text, tool_calls = _parse_and_validate_tools(
+        output.text, openai_request, should_parse_tools
+    )
 
     # Clean output text
     final_content = None
@@ -2981,14 +2986,9 @@ async def _stream_anthropic_messages(
                 yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
     # Check for tool calls in accumulated text
-    if should_parse_tools:
-        _, tool_calls = _parse_tool_calls_with_parser(
-            accumulated_text, openai_request
-        )
-        if tool_calls:
-            tool_calls = _validate_tool_calls(tool_calls, openai_request.tools)
-    else:
-        tool_calls = None
+    _, tool_calls = _parse_and_validate_tools(
+        accumulated_text, openai_request, should_parse_tools
+    )
 
     # Emit content_block_stop for text block
     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"

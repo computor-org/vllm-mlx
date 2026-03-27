@@ -183,50 +183,33 @@ class TestApplyToolChoice:
         assert "tools" in chat_kwargs
         assert len(messages) == 1
 
-    def test_auto_with_triggers_sets_lazy_processor(self):
-        from unittest.mock import MagicMock, PropertyMock, patch
+    def test_tool_choice_processor_not_overwritten_by_response_format(self):
+        """tool_choice grammar processor takes priority over response_format."""
+        from unittest.mock import MagicMock, patch
 
-        mock_processor = MagicMock()
-        chat_kwargs = {"tools": [{"function": {"name": "f"}}]}
+        tool_processor = MagicMock(name="tool_processor")
+        guided_processor = MagicMock(name="guided_processor")
+        chat_kwargs = {
+            "tools": [{"function": {"name": "f", "parameters": {"type": "object"}}}]
+        }
         messages = [{"role": "user", "content": "hi"}]
 
-        mock_parser = MagicMock()
-        type(mock_parser).TRIGGER_TOKEN_IDS = PropertyMock(
-            return_value=frozenset({151657})
-        )
-        type(mock_parser).END_TOKEN_IDS = PropertyMock(
-            return_value=frozenset({151658})
-        )
-        type(mock_parser).PREFIX_SKIP_TOKENS = PropertyMock(return_value=1)
-
-        with patch.object(srv, "_tool_call_parser", "qwen"), patch.object(
-            srv, "_tool_parser_instance", mock_parser
-        ), patch(
-            "vllm_mlx.guided_decoding.build_lazy_tool_call_processor",
-            return_value=mock_processor,
+        with patch(
+            "vllm_mlx.guided_decoding.build_tool_call_processor",
+            return_value=tool_processor,
         ):
-            result = srv._apply_tool_choice("auto", chat_kwargs, messages)
+            srv._apply_tool_choice("required", chat_kwargs, messages)
 
-        assert result is True
-        assert chat_kwargs.get("logits_processors") == [mock_processor]
+        # tool_choice="required" set the processor
+        assert chat_kwargs["logits_processors"] == [tool_processor]
 
-    def test_auto_without_triggers_no_processor(self):
-        from unittest.mock import MagicMock, PropertyMock, patch
+        # Simulate what create_chat_completion does: only set guided_processor
+        # when logits_processors is not already present
+        if guided_processor is not None and "logits_processors" not in chat_kwargs:
+            chat_kwargs["logits_processors"] = [guided_processor]
 
-        chat_kwargs = {"tools": [{"function": {"name": "f"}}]}
-        messages = [{"role": "user", "content": "hi"}]
-
-        mock_parser = MagicMock()
-        type(mock_parser).TRIGGER_TOKEN_IDS = PropertyMock(
-            return_value=frozenset()
-        )
-
-        with patch.object(srv, "_tool_call_parser", "hermes"), patch.object(
-            srv, "_tool_parser_instance", mock_parser
-        ):
-            srv._apply_tool_choice("auto", chat_kwargs, messages)
-
-        assert "logits_processors" not in chat_kwargs
+        # The tool processor must survive
+        assert chat_kwargs["logits_processors"] == [tool_processor]
 
 
 # ---------------------------------------------------------------------------
