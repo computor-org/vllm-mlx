@@ -478,6 +478,36 @@ def _parse_tool_calls_with_parser(
         return parse_tool_calls(output_text, request_dict)
 
 
+def _parse_and_validate_tools(
+    output_text: str,
+    request: ChatCompletionRequest,
+    should_parse: bool,
+) -> tuple[str, list | None]:
+    """Parse tool calls from model output and validate against declared tools.
+
+    When *should_parse* is False (tool_choice="none"), returns the raw text
+    with no tool calls.
+    """
+    if not should_parse:
+        return output_text, None
+    cleaned, tool_calls = _parse_tool_calls_with_parser(output_text, request)
+    if tool_calls:
+        tool_calls = _validate_tool_calls(tool_calls, request.tools)
+    return cleaned, tool_calls
+
+
+def _set_tool_grammar_processor(chat_kwargs: dict, tools: list) -> None:
+    """Attach an Outlines grammar-constrained logits processor for tool calls.
+
+    Modifies *chat_kwargs* in place. Does nothing when Outlines is unavailable.
+    """
+    from .guided_decoding import build_tool_call_processor
+
+    processor = build_tool_call_processor(tools)
+    if processor:
+        chat_kwargs["logits_processors"] = [processor]
+
+
 def _apply_tool_choice(
     tool_choice: str | dict | None,
     chat_kwargs: dict,
@@ -506,11 +536,7 @@ def _apply_tool_choice(
                 ),
             },
         )
-        from .guided_decoding import build_tool_call_processor
-
-        processor = build_tool_call_processor(chat_kwargs.get("tools", []))
-        if processor:
-            chat_kwargs["logits_processors"] = [processor]
+        _set_tool_grammar_processor(chat_kwargs, chat_kwargs.get("tools", []))
         return True
 
     if isinstance(tool_choice, dict):
@@ -533,11 +559,7 @@ def _apply_tool_choice(
                             "content": f"You MUST call the function: {fname}",
                         },
                     )
-                    from .guided_decoding import build_tool_call_processor
-
-                    processor = build_tool_call_processor(filtered)
-                    if processor:
-                        chat_kwargs["logits_processors"] = [processor]
+                    _set_tool_grammar_processor(chat_kwargs, filtered)
                     return True
             # Named function not found in tools — fall back to auto
             logger.warning(
@@ -1041,14 +1063,9 @@ async def _run_responses_request(
     if output is None:
         return None, []
 
-    if should_parse_tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-            output.text, chat_request
-        )
-        if tool_calls:
-            tool_calls = _validate_tool_calls(tool_calls, chat_request.tools)
-    else:
-        cleaned_text, tool_calls = output.text, None
+    cleaned_text, tool_calls = _parse_and_validate_tools(
+        output.text, chat_request, should_parse_tools
+    )
     reasoning_text = None
     if _reasoning_parser and not tool_calls:
         reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
@@ -1317,14 +1334,9 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         )
         sequence += 1
 
-    if should_parse_tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-            raw_accumulated_text, chat_request
-        )
-        if tool_calls:
-            tool_calls = _validate_tool_calls(tool_calls, chat_request.tools)
-    else:
-        cleaned_text, tool_calls = raw_accumulated_text, None
+    cleaned_text, tool_calls = _parse_and_validate_tools(
+        raw_accumulated_text, chat_request, should_parse_tools
+    )
     final_text = accumulated_text
     if cleaned_text is not None and not final_text and not tool_calls:
         final_text = clean_output_text(cleaned_text)
@@ -2546,12 +2558,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     )
 
     # Parse tool calls from output using configured parser
-    if should_parse_tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(output.text, request)
-        if tool_calls:
-            tool_calls = _validate_tool_calls(tool_calls, request.tools)
-    else:
-        cleaned_text, tool_calls = output.text, None
+    cleaned_text, tool_calls = _parse_and_validate_tools(
+        output.text, request, should_parse_tools
+    )
 
     # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
     reasoning_text = None
@@ -2782,14 +2791,9 @@ async def create_anthropic_message(
     )
 
     # Parse tool calls
-    if should_parse_tools:
-        cleaned_text, tool_calls = _parse_tool_calls_with_parser(
-            output.text, openai_request
-        )
-        if tool_calls:
-            tool_calls = _validate_tool_calls(tool_calls, openai_request.tools)
-    else:
-        cleaned_text, tool_calls = output.text, None
+    cleaned_text, tool_calls = _parse_and_validate_tools(
+        output.text, openai_request, should_parse_tools
+    )
 
     # Clean output text
     final_content = None
@@ -2981,14 +2985,9 @@ async def _stream_anthropic_messages(
                 yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
     # Check for tool calls in accumulated text
-    if should_parse_tools:
-        _, tool_calls = _parse_tool_calls_with_parser(
-            accumulated_text, openai_request
-        )
-        if tool_calls:
-            tool_calls = _validate_tool_calls(tool_calls, openai_request.tools)
-    else:
-        tool_calls = None
+    _, tool_calls = _parse_and_validate_tools(
+        accumulated_text, openai_request, should_parse_tools
+    )
 
     # Emit content_block_stop for text block
     yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
