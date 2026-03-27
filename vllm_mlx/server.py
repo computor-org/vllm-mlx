@@ -468,14 +468,15 @@ def _apply_tool_choice(
         return False
 
     if tool_choice == "required":
-        messages.append(
+        messages.insert(
+            0,
             {
                 "role": "system",
                 "content": (
                     "You MUST call one of the provided tools. "
                     "Do not respond with plain text."
                 ),
-            }
+            },
         )
         from .guided_decoding import build_tool_call_processor
 
@@ -497,11 +498,12 @@ def _apply_tool_choice(
                 ]
                 if filtered:
                     chat_kwargs["tools"] = filtered
-                    messages.append(
+                    messages.insert(
+                        0,
                         {
                             "role": "system",
                             "content": f"You MUST call the function: {fname}",
-                        }
+                        },
                     )
                     from .guided_decoding import build_tool_call_processor
 
