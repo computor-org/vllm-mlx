@@ -2521,7 +2521,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         request.tool_choice, chat_kwargs, messages
     )
 
-    if guided_processor is not None:
+    if guided_processor is not None and "logits_processors" not in chat_kwargs:
         chat_kwargs["logits_processors"] = [guided_processor]
 
     if request.stream:

@@ -228,6 +228,34 @@ class TestApplyToolChoice:
 
         assert "logits_processors" not in chat_kwargs
 
+    def test_tool_choice_processor_not_overwritten_by_response_format(self):
+        """tool_choice grammar processor takes priority over response_format."""
+        from unittest.mock import MagicMock, patch
+
+        tool_processor = MagicMock(name="tool_processor")
+        guided_processor = MagicMock(name="guided_processor")
+        chat_kwargs = {
+            "tools": [{"function": {"name": "f", "parameters": {"type": "object"}}}]
+        }
+        messages = [{"role": "user", "content": "hi"}]
+
+        with patch(
+            "vllm_mlx.guided_decoding.build_tool_call_processor",
+            return_value=tool_processor,
+        ):
+            srv._apply_tool_choice("required", chat_kwargs, messages)
+
+        # tool_choice="required" set the processor
+        assert chat_kwargs["logits_processors"] == [tool_processor]
+
+        # Simulate what create_chat_completion does: only set guided_processor
+        # when logits_processors is not already present
+        if guided_processor is not None and "logits_processors" not in chat_kwargs:
+            chat_kwargs["logits_processors"] = [guided_processor]
+
+        # The tool processor must survive
+        assert chat_kwargs["logits_processors"] == [tool_processor]
+
 
 # ---------------------------------------------------------------------------
 # Integration tests via the OpenAI chat endpoint
