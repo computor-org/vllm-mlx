@@ -130,13 +130,12 @@ class BaseThinkingReasoningParser(ReasoningParser):
         if self.end_token in current_text:
             return self._handle_implicit_think(delta_text, end_in_prev, end_in_delta)
 
-        # Case 3: No think tags seen yet
-        # We can't know if <think> was in the prompt, so we must make a choice:
-        # - Treat as content (safe, but loses reasoning if think was in prompt)
-        # - Treat as reasoning (risky, wrong if no thinking at all)
-        # We choose to treat as reasoning IF we haven't seen </think> yet,
-        # because if think was in prompt, we want to capture the reasoning.
-        # This will be corrected once </think> is seen.
+        # Case 3: No think tags seen yet.
+        # Treat as reasoning (assuming <think> was in the prompt) UNLESS
+        # the text contains tool call markup, which must stay as content
+        # so the tool parser can process it.
+        if "<tool_call>" in current_text or "<tool_call>" in delta_text:
+            return DeltaMessage(content=delta_text)
         return DeltaMessage(reasoning=delta_text)
 
     def _handle_explicit_think(
