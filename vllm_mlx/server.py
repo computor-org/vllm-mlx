@@ -758,7 +758,11 @@ async def _run_chat_with_invalid_tool_repair(
             endpoint,
             len(parsed.invalid_tool_calls),
         )
-        current_messages.extend(_build_invalid_tool_repair_messages(parsed))
+        repair_messages, _, _ = extract_multimodal_content(
+            _build_invalid_tool_repair_messages(parsed),
+            preserve_native_format=engine.preserve_native_tool_format,
+        )
+        current_messages.extend(repair_messages)
         repaired = True
 
     return None

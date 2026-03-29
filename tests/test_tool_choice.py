@@ -593,8 +593,8 @@ class TestToolCallValidationEndpoint:
         assert len(engine.chat_calls) == 2
         retry_messages = engine.chat_calls[1][0]
         assert retry_messages[-2]["role"] == "assistant"
-        assert retry_messages[-2]["tool_calls"][0]["function"]["name"] == "nonexistent_func"
-        assert retry_messages[-1]["role"] == "tool"
+        assert "[Calling tool: nonexistent_func(" in retry_messages[-2]["content"]
+        assert retry_messages[-1]["role"] == "user"
         assert '"error": "invalid_tool_call"' in retry_messages[-1]["content"]
         assert '"error_type": "unknown_tool"' in retry_messages[-1]["content"]
 

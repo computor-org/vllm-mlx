@@ -440,9 +440,40 @@ class TestResponsesEndpoint:
         assert engine.chat.await_count == 2
         retry_messages = engine.chat.await_args_list[1].kwargs["messages"]
         assert retry_messages[-2]["role"] == "assistant"
-        assert retry_messages[-2]["tool_calls"][0]["function"]["name"] == "send_input"
-        assert retry_messages[-1]["role"] == "tool"
+        assert "[Calling tool: send_input(" in retry_messages[-2]["content"]
+        assert retry_messages[-1]["role"] == "user"
         assert '"error_type": "unknown_tool"' in retry_messages[-1]["content"]
+
+    def test_invalid_tool_repair_normalizes_native_tool_format_for_retry(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(
+            _output('<tool_call>{"name":"send_input","arguments":{"text":"oops"}}</tool_call>'),
+            _output('<tool_call>{"name":"shell","arguments":{"cmd":"pwd"}}</tool_call>'),
+        )
+        engine.preserve_native_tool_format = True
+        srv._engine = engine
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Use a tool",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "shell",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        retry_messages = engine.chat.await_args_list[1].kwargs["messages"]
+        assert retry_messages[-2]["tool_calls"][0]["function"]["arguments"] == {
+            "text": "oops"
+        }
 
     def test_repaired_response_history_persists_only_final_output(self, client):
         import vllm_mlx.server as srv
@@ -550,7 +581,7 @@ class TestResponsesEndpoint:
         assert '"name":"shell"' in body or '"name": "shell"' in body
         assert engine.chat.await_count == 2
         retry_messages = engine.chat.await_args_list[1].kwargs["messages"]
-        assert retry_messages[-1]["role"] == "tool"
+        assert retry_messages[-1]["role"] == "user"
         assert '"error_type": "unknown_tool"' in retry_messages[-1]["content"]
         engine.stream_chat.assert_not_awaited()
 
