@@ -54,6 +54,8 @@ class FakeEngine:
         self.captured_messages = None
         self.captured_kwargs = None
         self.chat_calls = []
+        self.stream_calls = []
+        self._stream_outputs = []
 
     async def chat(self, messages, **kwargs):
         self.captured_messages = messages
@@ -66,6 +68,11 @@ class FakeEngine:
             completion_tokens=5,
             finish_reason="stop",
         )
+
+    async def stream_chat(self, messages, **kwargs):
+        self.stream_calls.append((messages, kwargs))
+        for output in self._stream_outputs:
+            yield output
 
 
 def _patch_engine(engine):
@@ -598,6 +605,34 @@ class TestToolCallValidationEndpoint:
         assert '"error": "invalid_tool_call"' in retry_messages[-1]["content"]
         assert '"error_type": "unknown_tool"' in retry_messages[-1]["content"]
 
+    def test_streaming_hallucinated_tool_call_repaired(self):
+        """Streaming chat buffers tool turns and emits only the repaired tool call."""
+        engine = FakeEngine(text=[HALLUCINATED_TOOL_CALL_MARKUP, TOOL_CALL_MARKUP])
+        orig_engine, orig_model = _patch_engine(engine)
+        client = TestClient(srv.app)
+        try:
+            with client.stream(
+                "POST",
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "do something"}],
+                    "tools": SAMPLE_TOOLS,
+                    "max_tokens": 64,
+                    "stream": True,
+                },
+            ) as response:
+                body = "".join(response.iter_text())
+        finally:
+            _restore_engine(orig_engine, orig_model)
+
+        assert response.status_code == 200
+        assert '"name":"get_weather"' in body or '"name": "get_weather"' in body
+        assert "nonexistent_func" not in body
+        assert "data: [DONE]" in body
+        assert len(engine.chat_calls) == 2
+        assert engine.stream_calls == []
+
     def test_valid_tool_call_kept(self):
         """Engine returns tool call for declared function; response has tool_calls."""
         engine = FakeEngine(text=TOOL_CALL_MARKUP)
@@ -661,3 +696,48 @@ class TestToolCallValidationEndpoint:
         assert body["content"][0]["type"] == "tool_use"
         assert body["content"][0]["name"] == "get_time"
         assert len(engine.chat_calls) == 2
+
+    def test_anthropic_streaming_invalid_tool_call_repaired(self):
+        """Anthropic streaming buffers tool turns and emits only the repaired tool_use."""
+        engine = FakeEngine(
+            text=[
+                HALLUCINATED_TOOL_CALL_MARKUP,
+                '<tool_call>\n{"name": "get_time", "arguments": {"timezone": "UTC"}}\n</tool_call>',
+            ]
+        )
+        orig_engine, orig_model = _patch_engine(engine)
+        client = TestClient(srv.app)
+        try:
+            with client.stream(
+                "POST",
+                "/v1/messages",
+                json={
+                    "model": "test-model",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "what time is it?"}],
+                    "tools": [
+                        {
+                            "name": "get_time",
+                            "description": "Get current time in a timezone",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"timezone": {"type": "string"}},
+                                "required": ["timezone"],
+                            },
+                        }
+                    ],
+                },
+            ) as response:
+                body = "".join(response.iter_text())
+        finally:
+            _restore_engine(orig_engine, orig_model)
+
+        assert response.status_code == 200
+        assert "event: message_start" in body
+        assert '"type": "tool_use"' in body or '"type":"tool_use"' in body
+        assert '"name": "get_time"' in body or '"name":"get_time"' in body
+        assert "nonexistent_func" not in body
+        assert "event: message_stop" in body
+        assert len(engine.chat_calls) == 2
+        assert engine.stream_calls == []

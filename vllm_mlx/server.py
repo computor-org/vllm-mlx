@@ -613,6 +613,19 @@ def _tool_call_to_message_dict(tool_call: ToolCall) -> dict:
     }
 
 
+def _tool_call_to_stream_delta(tool_call: ToolCall, index: int) -> dict:
+    """Convert a ToolCall into the OpenAI streaming delta wire shape."""
+    return {
+        "index": index,
+        "id": tool_call.id,
+        "type": tool_call.type,
+        "function": {
+            "name": tool_call.function.name,
+            "arguments": tool_call.function.arguments,
+        },
+    }
+
+
 def _build_invalid_tool_error_payload(invalid_call: InvalidToolCall) -> str:
     """Build a canonical JSON error payload for synthetic tool_result messages."""
     payload = {
@@ -3099,6 +3112,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                     engine,
                     messages,
                     request,
+                    raw_request=raw_request,
                     should_parse_tools=should_parse_tools,
                     **chat_kwargs,
                 ),
@@ -3317,7 +3331,12 @@ async def create_anthropic_message(
     if anthropic_request.stream:
         return StreamingResponse(
             _disconnect_guard(
-                _stream_anthropic_messages(engine, openai_request, anthropic_request),
+                _stream_anthropic_messages(
+                    engine,
+                    openai_request,
+                    anthropic_request,
+                    request,
+                ),
                 request,
             ),
             media_type="text/event-stream",
@@ -3490,6 +3509,7 @@ async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
     anthropic_request: AnthropicRequest,
+    raw_request: Request,
 ) -> AsyncIterator[str]:
     """
     Stream Anthropic Messages API SSE events.
@@ -3523,6 +3543,137 @@ async def _stream_anthropic_messages(
     should_parse_tools = _apply_tool_choice(
         openai_request.tool_choice, chat_kwargs, messages
     )
+
+    if _should_buffer_tool_stream(should_parse_tools, openai_request.tools):
+        execution = await _run_chat_with_invalid_tool_repair(
+            engine=engine,
+            messages=messages,
+            request=openai_request,
+            raw_request=raw_request,
+            chat_kwargs=chat_kwargs,
+            should_parse_tools=should_parse_tools,
+            endpoint="messages",
+            timeout=_default_timeout,
+        )
+        if execution is None:
+            return
+
+        final_content = None
+        if execution.parsed.cleaned_text:
+            final_content = clean_output_text(execution.parsed.cleaned_text)
+
+        tool_calls = execution.parsed.valid_tool_calls
+        finish_reason = "tool_calls" if tool_calls else execution.output.finish_reason
+        openai_response = ChatCompletionResponse(
+            model=_model_name,
+            choices=[
+                ChatCompletionChoice(
+                    message=AssistantMessage(
+                        content=final_content,
+                        tool_calls=tool_calls,
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=execution.total_prompt_tokens,
+                completion_tokens=execution.total_completion_tokens,
+                total_tokens=(
+                    execution.total_prompt_tokens + execution.total_completion_tokens
+                ),
+            ),
+        )
+        anthropic_response = openai_to_anthropic(openai_response, _model_name)
+
+        message_start = {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "model": _model_name,
+                "content": [],
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {
+                    "input_tokens": anthropic_response.usage.input_tokens,
+                    "output_tokens": 0,
+                },
+            },
+        }
+        yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+
+        for index, block in enumerate(anthropic_response.content):
+            if block.type == "text":
+                text_start = {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""},
+                }
+                yield f"event: content_block_start\ndata: {json.dumps(text_start)}\n\n"
+                if block.text:
+                    text_delta = {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": block.text},
+                    }
+                    yield f"event: content_block_delta\ndata: {json.dumps(text_delta)}\n\n"
+                yield (
+                    "event: content_block_stop\n"
+                    f"data: {json.dumps({'type': 'content_block_stop', 'index': index})}\n\n"
+                )
+                continue
+
+            if block.type == "tool_use":
+                tool_start = {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": {},
+                    },
+                }
+                yield f"event: content_block_start\ndata: {json.dumps(tool_start)}\n\n"
+                tool_delta = {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(block.input or {}),
+                    },
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(tool_delta)}\n\n"
+                yield (
+                    "event: content_block_stop\n"
+                    f"data: {json.dumps({'type': 'content_block_stop', 'index': index})}\n\n"
+                )
+
+        message_delta = {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": anthropic_response.stop_reason,
+                "stop_sequence": anthropic_response.stop_sequence,
+            },
+            "usage": {"output_tokens": anthropic_response.usage.output_tokens},
+        }
+        yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
+
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = (
+            execution.total_completion_tokens / elapsed if elapsed > 0 else 0
+        )
+        logger.info(
+            "Anthropic messages (stream, buffered): %s tokens in %.2fs (%.1f tok/s)%s",
+            execution.total_completion_tokens,
+            elapsed,
+            tokens_per_sec,
+            " after invalid-tool repair" if execution.repaired else "",
+        )
+
+        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+        return
 
     # Emit message_start
     message_start = {
@@ -3682,6 +3833,7 @@ async def stream_chat_completion(
     messages: list,
     request: ChatCompletionRequest,
     *,
+    raw_request: Request | None = None,
     should_parse_tools: bool = True,
     **kwargs,
 ) -> AsyncIterator[str]:
@@ -3703,6 +3855,84 @@ async def stream_chat_completion(
         ],
     )
     yield f"data: {first_chunk.model_dump_json()}\n\n"
+
+    if (
+        raw_request is not None
+        and _should_buffer_tool_stream(should_parse_tools, request.tools)
+    ):
+        execution = await _run_chat_with_invalid_tool_repair(
+            engine=engine,
+            messages=messages,
+            request=request,
+            raw_request=raw_request,
+            chat_kwargs=kwargs,
+            should_parse_tools=should_parse_tools,
+            endpoint="chat",
+            timeout=request.timeout or _default_timeout,
+        )
+        if execution is None:
+            return
+
+        cleaned_text = None
+        if execution.parsed.cleaned_text:
+            cleaned_text = clean_output_text(execution.parsed.cleaned_text)
+        tool_calls = execution.parsed.valid_tool_calls
+        finish_reason = "tool_calls" if tool_calls else execution.output.finish_reason
+
+        final_chunk = ChatCompletionChunk(
+            id=response_id,
+            model=_model_name,
+            choices=[
+                ChatCompletionChunkChoice(
+                    delta=ChatCompletionChunkDelta(
+                        content=cleaned_text,
+                        reasoning=execution.parsed.reasoning_text,
+                        tool_calls=(
+                            [
+                                _tool_call_to_stream_delta(tc, i)
+                                for i, tc in enumerate(tool_calls)
+                            ]
+                            if tool_calls
+                            else None
+                        ),
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+            usage=get_usage(execution.output),
+        )
+        yield f"data: {final_chunk.model_dump_json()}\n\n"
+
+        elapsed = time.perf_counter() - start_time
+        tokens_per_sec = (
+            execution.total_completion_tokens / elapsed if elapsed > 0 else 0
+        )
+        logger.info(
+            "Chat completion (stream, buffered): %s tokens in %.2fs (%.1f tok/s)%s",
+            execution.total_completion_tokens,
+            elapsed,
+            tokens_per_sec,
+            " after invalid-tool repair" if execution.repaired else "",
+        )
+
+        if include_usage:
+            usage_chunk = ChatCompletionChunk(
+                id=response_id,
+                model=_model_name,
+                choices=[],
+                usage=Usage(
+                    prompt_tokens=execution.total_prompt_tokens,
+                    completion_tokens=execution.total_completion_tokens,
+                    total_tokens=(
+                        execution.total_prompt_tokens
+                        + execution.total_completion_tokens
+                    ),
+                ),
+            )
+            yield f"data: {usage_chunk.model_dump_json()}\n\n"
+
+        yield "data: [DONE]\n\n"
+        return
 
     # Track if we need to add <think> prefix for thinking models (when no reasoning parser)
     # The template adds <think> to the prompt, so the model output starts inside the think block
