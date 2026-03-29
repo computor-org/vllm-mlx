@@ -201,6 +201,40 @@ class TestServeCli:
 
         assert args.tool_call_parser == "gpt-oss"
 
+    def test_continuous_batching_wires_prefill_step_size(self, monkeypatch):
+        """Batched serve mode should pass --prefill-step-size into SchedulerConfig."""
+        import uvicorn
+
+        from vllm_mlx import server
+        from vllm_mlx.cli import create_parser, serve_command
+
+        parser = create_parser()
+        args = parser.parse_args(
+            [
+                "serve",
+                "mlx-community/Qwen3.5-9B-MLX-8bit",
+                "--continuous-batching",
+                "--prefill-step-size",
+                "16384",
+            ]
+        )
+
+        captured = {}
+
+        def fake_load_model(*_args, **kwargs):
+            captured["scheduler_config"] = kwargs["scheduler_config"]
+
+        def fake_run(*_args, **_kwargs):
+            captured["uvicorn_run"] = True
+
+        monkeypatch.setattr(server, "load_model", fake_load_model)
+        monkeypatch.setattr(uvicorn, "run", fake_run)
+
+        serve_command(args)
+
+        assert captured["scheduler_config"].prefill_step_size == 16384
+        assert captured["uvicorn_run"] is True
+
 
 # =============================================================================
 # Helper Function Tests
