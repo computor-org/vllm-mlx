@@ -198,6 +198,23 @@ class TestHarmonyToolParser:
         parsed_args = json.loads(result.tool_calls[0]["arguments"])
         assert parsed_args["filter"]["type"] == "range"
 
+    def test_consecutive_duplicate_tool_calls_are_deduped(self, parser):
+        """Repeated identical commentary blocks should collapse to one call."""
+        text = (
+            "<|channel|>commentary to=functions.get_weather\n"
+            "<|constrain|>json\n"
+            '<|message|>{"city":"Paris"}\n'
+            "<|call|>\n"
+            "<|channel|>commentary to=functions.get_weather\n"
+            "<|constrain|>json\n"
+            '<|message|>{"city":"Paris"}\n'
+            "<|call|>"
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+
     def test_streaming_no_tool_markers(self, parser):
         """Streaming: plain text passes through as content."""
         result = parser.extract_tool_calls_streaming("", "Hello", "Hello")
@@ -225,6 +242,25 @@ class TestHarmonyToolParser:
             '<|message|>{"a":'
         )
         result = parser.extract_tool_calls_streaming("", current, '{"a":')
+        assert result is None
+
+    def test_streaming_duplicate_tool_call_is_not_reemitted(self, parser):
+        """Streaming should only emit newly completed Harmony tool calls."""
+        previous = (
+            "<|channel|>commentary to=functions.func\n"
+            "<|constrain|>json\n"
+            '<|message|>{"a": 1}\n'
+            "<|call|>"
+        )
+        current = (
+            previous
+            + "\n<|channel|>commentary to=functions.func\n"
+            + "<|constrain|>json\n"
+            + '<|message|>{"a": 1}\n'
+            + "<|call|>"
+        )
+
+        result = parser.extract_tool_calls_streaming(previous, current, "<|call|>")
         assert result is None
 
 
@@ -388,26 +424,60 @@ class TestHarmonyReasoningParser:
         assert parser._current_channel is None
         assert parser._in_message is False
 
-    def test_streaming_commentary_suppressed(self, parser):
-        """Streaming: commentary channel output is suppressed."""
+    def test_streaming_commentary_routed_as_content(self, parser):
+        """Streaming: commentary channel is forwarded for downstream tool parsing."""
         parser.reset_state()
 
-        parser.extract_reasoning_streaming(
+        r1 = parser.extract_reasoning_streaming(
             "",
             "<|channel|>commentary to=functions.f\n",
             "<|channel|>commentary to=functions.f\n",
         )
-        parser.extract_reasoning_streaming(
+        assert r1 is not None
+        assert r1.content == "<|channel|>commentary to=functions.f\n"
+
+        r2 = parser.extract_reasoning_streaming(
             "<|channel|>commentary to=functions.f\n",
             "<|channel|>commentary to=functions.f\n<|message|>",
             "<|message|>",
         )
+        assert r2 is not None
+        assert r2.content == "<|message|>"
+
         r = parser.extract_reasoning_streaming(
             "<|channel|>commentary to=functions.f\n<|message|>",
             '<|channel|>commentary to=functions.f\n<|message|>{"a":1}',
             '{"a":1}',
         )
-        assert r is None
+        assert r is not None
+        assert r.content == '{"a":1}'
+
+    def test_streaming_split_commentary_header(self, parser):
+        """Split commentary headers should still be routed to downstream tool parsing."""
+        parser.reset_state()
+
+        accumulated = ""
+        content_parts = []
+        for token in [
+            "<|channel|>",
+            "comment",
+            "ary to",
+            "=functions.get_weather",
+            " <|constrain|>",
+            "json",
+            "<|message|>",
+            '{"city":"Paris"}',
+            "<|call|>",
+        ]:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result and result.content:
+                content_parts.append(result.content)
+
+        combined = "".join(content_parts)
+        assert "<|channel|>commentary to=functions.get_weather" in combined
+        assert '<|message|>{"city":"Paris"}' in combined
 
 
 # ============================================================================

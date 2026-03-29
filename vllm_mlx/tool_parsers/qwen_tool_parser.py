@@ -40,6 +40,17 @@ class QwenToolParser(ToolParser):
     # Pattern for XML-style: <tool_call>{"json"}</tool_call>
     XML_PATTERN = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
+    # Pattern for XML-style function blocks:
+    # <tool_call><function=name><parameter=arg>value</parameter></function></tool_call>
+    FUNCTION_PATTERN = re.compile(
+        r"<tool_call>\s*<function=([^>]+)>(.*?)</function>\s*</tool_call>",
+        re.DOTALL,
+    )
+    PARAM_PATTERN = re.compile(
+        r"<parameter=([^>]+)>\s*(.*?)\s*</parameter>",
+        re.DOTALL,
+    )
+
     # Pattern for bracket-style: [Calling tool: func_name({...})]
     BRACKET_PATTERN = re.compile(r"\[Calling tool:\s*(\w+)\((\{.*?\})\)\]", re.DOTALL)
 
@@ -101,6 +112,29 @@ class QwenToolParser(ToolParser):
         if xml_matches:
             cleaned_text = self.XML_PATTERN.sub("", cleaned_text).strip()
 
+        # Try function/parameter pattern used by Qwen tool templates
+        function_matches = self.FUNCTION_PATTERN.findall(cleaned_text)
+        for name, params_block in function_matches:
+            arguments = {}
+            for param_name, param_value in self.PARAM_PATTERN.findall(params_block):
+                raw_value = param_value.strip()
+                try:
+                    arguments[param_name.strip()] = json.loads(raw_value)
+                except json.JSONDecodeError:
+                    arguments[param_name.strip()] = raw_value
+
+            if name.strip():
+                tool_calls.append(
+                    {
+                        "id": generate_tool_id(),
+                        "name": name.strip(),
+                        "arguments": json.dumps(arguments, ensure_ascii=False),
+                    }
+                )
+
+        if function_matches:
+            cleaned_text = self.FUNCTION_PATTERN.sub("", cleaned_text).strip()
+
         if tool_calls:
             return ExtractedToolCallInformation(
                 tools_called=True,
@@ -135,11 +169,12 @@ class QwenToolParser(ToolParser):
 
         # If we're in a tool call, accumulate and parse at the end
         # For simplicity, return None during accumulation
-        if "</tool_call>" in delta_text or ")]" in delta_text:
+        if "</tool_call>" in current_text or ")]" in current_text:
             # Tool call complete, parse the whole thing
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
                 return {
+                    "complete": True,
                     "tool_calls": [
                         {
                             "index": i,

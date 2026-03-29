@@ -437,6 +437,36 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
+
+        # mlx-lm non-streaming chat with tools can stall indefinitely on some
+        # local models, while the streaming path completes normally. Reuse the
+        # streaming implementation and aggregate its final state so both chat
+        # APIs share the same tool-capable execution path.
+        if tools and not self._is_mllm:
+            stream_kwargs = dict(kwargs)
+            if chat_template_kwargs:
+                stream_kwargs["chat_template_kwargs"] = chat_template_kwargs
+            final_output = GenerationOutput(text="")
+            async for output in self.stream_chat(
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                tools=tools,
+                images=images,
+                videos=videos,
+                **stream_kwargs,
+            ):
+                final_output = output
+            text = final_output.text
+            return GenerationOutput(
+                text=text,
+                tokens=list(final_output.tokens),
+                prompt_tokens=final_output.prompt_tokens,
+                completion_tokens=final_output.completion_tokens,
+                finish_reason=final_output.finish_reason,
+            )
         # Convert tools for template if provided
         template_tools = convert_tools_for_template(tools) if tools else None
 
@@ -450,6 +480,7 @@ class SimpleEngine(BaseEngine):
                     max_tokens=max_tokens,
                     temperature=temperature,
                     tools=template_tools,
+                    chat_template_kwargs=chat_template_kwargs,
                     **kwargs,
                 )
                 text = clean_output_text(output.text)
@@ -469,6 +500,7 @@ class SimpleEngine(BaseEngine):
                     temperature=temperature,
                     top_p=top_p,
                     tools=template_tools,
+                    chat_template_kwargs=chat_template_kwargs,
                     **kwargs,
                 )
                 text = clean_output_text(output.text)

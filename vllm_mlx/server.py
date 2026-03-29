@@ -162,6 +162,15 @@ _tool_call_parser: str | None = None  # Parser name: auto, mistral, qwen, llama,
 _tool_parser_instance = None  # Instantiated parser
 
 
+def _looks_like_streaming_tool_markup(delta_text: str) -> bool:
+    """Cheap trigger check before invoking streaming tool parsers."""
+    return (
+        "<" in delta_text
+        or "[TOOL_CALLS]" in delta_text
+        or "[Calling tool:" in delta_text
+    )
+
+
 def _load_prefix_cache_from_disk() -> None:
     """Load prefix cache from disk during startup."""
     try:
@@ -418,7 +427,1042 @@ def _parse_tool_calls_with_parser(
         logger.warning(f"Tool parser error: {e}")
         return parse_tool_calls(output_text, request_dict)
 
+def _parse_and_validate_tools(
+    output_text: str,
+    request: ChatCompletionRequest,
+    should_parse: bool,
+) -> tuple[str, list | None]:
+    """Parse tool calls from model output and validate against declared tools.
 
+    When *should_parse* is False (tool_choice="none"), returns the raw text
+    with no tool calls.
+    """
+    if not should_parse:
+        return output_text, None
+    cleaned, tool_calls = _parse_tool_calls_with_parser(output_text, request)
+    if tool_calls:
+        tool_calls = _validate_tool_calls(tool_calls, request.tools)
+    return cleaned, tool_calls
+
+
+def _set_tool_grammar_processor(chat_kwargs: dict, tools: list) -> None:
+    """Attach an Outlines grammar-constrained logits processor for tool calls.
+
+    Modifies *chat_kwargs* in place. Does nothing when Outlines is unavailable.
+    """
+    from .guided_decoding import build_tool_call_processor
+
+    processor = build_tool_call_processor(tools)
+    if processor:
+        chat_kwargs["logits_processors"] = [processor]
+
+
+def _apply_tool_choice(
+    tool_choice: str | dict | None,
+    chat_kwargs: dict,
+    messages: list[dict],
+) -> bool:
+    """Apply tool_choice policy to chat kwargs and messages.
+
+    Modifies *chat_kwargs* and *messages* in place so that the chat template
+    and downstream parsing honour the caller's tool_choice setting.
+
+    Returns ``True`` when the model output should be parsed for tool calls,
+    ``False`` when tool-call parsing must be skipped (``tool_choice="none"``).
+    """
+    if tool_choice == "none":
+        chat_kwargs.pop("tools", None)
+        return False
+
+    if tool_choice == "required":
+        messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": (
+                    "You MUST call one of the provided tools. "
+                    "Do not respond with plain text."
+                ),
+            },
+        )
+        _set_tool_grammar_processor(chat_kwargs, chat_kwargs.get("tools", []))
+        return True
+
+    if isinstance(tool_choice, dict):
+        func_info = tool_choice.get("function", {})
+        fname = func_info.get("name", "") if isinstance(func_info, dict) else ""
+        if fname:
+            template_tools = chat_kwargs.get("tools")
+            if template_tools:
+                filtered = [
+                    t
+                    for t in template_tools
+                    if t.get("function", {}).get("name") == fname
+                ]
+                if filtered:
+                    chat_kwargs["tools"] = filtered
+                    messages.insert(
+                        0,
+                        {
+                            "role": "system",
+                            "content": f"You MUST call the function: {fname}",
+                        },
+                    )
+                    _set_tool_grammar_processor(chat_kwargs, filtered)
+                    return True
+            # Named function not found in tools — fall back to auto
+            logger.warning(
+                "tool_choice function %r not found in tools, falling back to auto",
+                fname,
+            )
+        return True
+
+    # "auto" or None — apply lazy grammar trigger when the parser defines one.
+    # The processor stays inactive until the model emits a tool call trigger
+    # token, then constrains the JSON body to match the tool schemas.
+    if chat_kwargs.get("tools") and _tool_call_parser and _tool_parser_instance:
+        parser_cls = type(_tool_parser_instance)
+        if parser_cls.TRIGGER_TOKEN_IDS:
+            from .guided_decoding import build_lazy_tool_call_processor
+
+            processor = build_lazy_tool_call_processor(
+                tools=chat_kwargs.get("tools", []),
+                trigger_tokens=parser_cls.TRIGGER_TOKEN_IDS,
+                end_tokens=parser_cls.END_TOKEN_IDS,
+                prefix_skip=parser_cls.PREFIX_SKIP_TOKENS,
+            )
+            if processor:
+                chat_kwargs["logits_processors"] = [processor]
+    return True
+
+
+def _validate_tool_calls(
+    tool_calls: list | None,
+    tools: list | None,
+) -> list | None:
+    """Remove tool calls with unknown names or invalid arguments.
+
+    Validates each parsed tool call against the declared tools:
+    1. Function name must exist in the tools list.
+    2. Arguments must be valid JSON.
+    3. Arguments must conform to the tool's parameters schema (if declared).
+
+    Invalid tool calls are dropped with a warning log.
+    Returns None if all tool calls are invalid.
+    """
+    if not tool_calls:
+        return None
+    if tools is None:
+        return tool_calls
+
+    # Build lookup: function name -> parameters schema
+    tools_by_name: dict[str, dict | None] = {}
+    for t in tools:
+        func = (
+            t.function
+            if isinstance(t, ToolDefinition)
+            else (t.get("function") if isinstance(t, dict) else None)
+        )
+        if func and isinstance(func, dict):
+            fname = func.get("name")
+            if fname:
+                tools_by_name[fname] = func.get("parameters")
+
+    valid = []
+    for tc in tool_calls:
+        name = tc.function.name
+        if name not in tools_by_name:
+            logger.warning("Dropping tool call with unknown function: %s", name)
+            continue
+        schema = tools_by_name[name]
+        if schema:
+            try:
+                args = json.loads(tc.function.arguments)
+                jsonschema.validate(args, schema)
+            except (json.JSONDecodeError, jsonschema.ValidationError, jsonschema.SchemaError) as exc:
+                logger.warning(
+                    "Dropping tool call %s: invalid arguments: %s", name, exc
+                )
+                continue
+        valid.append(tc)
+
+    return valid or None
+
+
+def _new_response_item_id(prefix: str) -> str:
+    """Generate stable OpenAI-style item ids."""
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _response_content_to_text(content) -> str:
+    """Normalize Responses API content items into plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+
+    text_parts = []
+    for part in content:
+        if isinstance(part, dict):
+            part_type = part.get("type")
+            text = part.get("text", "")
+        else:
+            part_type = getattr(part, "type", None)
+            text = getattr(part, "text", "")
+        if part_type in {"text", "input_text", "output_text"}:
+            text_parts.append(text)
+    return "\n".join(part for part in text_parts if part)
+
+
+def _responses_tools_to_chat_tools(
+    tools: list[ResponseFunctionTool | dict],
+) -> tuple[list[dict] | None, list[str]]:
+    """Convert supported Responses tools and report unsupported tool types."""
+    if not tools:
+        return None, []
+
+    supported: list[dict] = []
+    unsupported: list[str] = []
+
+    for tool in tools:
+        if isinstance(tool, ResponseFunctionTool):
+            tool_type = tool.type
+            tool_name = tool.name
+            tool_description = tool.description or ""
+            tool_parameters = tool.parameters
+        elif isinstance(tool, dict):
+            tool_type = tool.get("type", "unknown")
+            tool_name = tool.get("name", "")
+            tool_description = tool.get("description", "")
+            tool_parameters = tool.get("parameters", {})
+        else:
+            unsupported.append(type(tool).__name__)
+            continue
+
+        if tool_type == "function":
+            supported.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "description": tool_description,
+                        "parameters": tool_parameters
+                        or {"type": "object", "properties": {}},
+                    },
+                }
+            )
+        else:
+            unsupported.append(tool_type)
+
+    return supported or None, unsupported
+
+
+def _responses_input_to_chat_messages(request: ResponsesRequest) -> list[dict]:
+    """Convert Responses API input items into chat-completions-style messages."""
+    messages: list[dict] = []
+
+    if request.previous_response_id:
+        previous = _responses_store.get(request.previous_response_id)
+        if previous is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Previous response `{request.previous_response_id}` not found",
+            )
+        messages.extend(copy.deepcopy(previous["messages"]))
+
+    if request.instructions:
+        messages.append({"role": "system", "content": request.instructions})
+
+    if isinstance(request.input, str):
+        messages.append({"role": "user", "content": request.input})
+        return messages
+
+    for item in request.input:
+        if isinstance(item, dict):
+            item_type = item.get("type", "")
+            if item_type == "message":
+                role = item.get("role", "user")
+                if role == "developer":
+                    role = "system"
+                messages.append(
+                    {
+                        "role": role,
+                        "content": _response_content_to_text(item.get("content")),
+                    }
+                )
+            elif item_type == "function_call":
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": item.get("call_id", _new_response_item_id("call")),
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments", ""),
+                                },
+                            }
+                        ],
+                    }
+                )
+            elif item_type == "function_call_output":
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": item.get("call_id", ""),
+                        "content": item.get("output", ""),
+                    }
+                )
+            elif item_type == "reasoning":
+                parts = item.get("content", [])
+                reasoning_text = "\n".join(
+                    p.get("text", "") for p in parts if isinstance(p, dict)
+                )
+                if reasoning_text:
+                    messages.append({"role": "assistant", "content": reasoning_text})
+            else:
+                logger.info(
+                    "Skipping unsupported Responses input item type %r", item_type
+                )
+            continue
+
+        if isinstance(item, ResponseMessageItem):
+            role = item.role
+            if role == "developer":
+                role = "system"
+            messages.append(
+                {
+                    "role": role,
+                    "content": _response_content_to_text(item.content),
+                }
+            )
+        elif isinstance(item, ResponseFunctionCallItem):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": item.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": item.name,
+                                "arguments": item.arguments,
+                            },
+                        }
+                    ],
+                }
+            )
+        elif isinstance(item, ResponseFunctionCallOutputItem):
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": item.call_id,
+                    "content": item.output,
+                }
+            )
+        elif isinstance(item, ResponseReasoningItem):
+            reasoning_text = "\n".join(part.text for part in (item.content or []))
+            if reasoning_text:
+                messages.append({"role": "assistant", "content": reasoning_text})
+        else:
+            logger.info(
+                "Skipping unsupported Responses input item type %r",
+                getattr(item, "type", type(item).__name__),
+            )
+
+    return messages
+
+
+def _responses_request_to_new_persisted_messages(request: ResponsesRequest) -> list[dict]:
+    """Persist only the current request's replayable input items."""
+    request_without_history = request.model_copy(
+        update={"previous_response_id": None, "instructions": None},
+        deep=True,
+    )
+    return _responses_input_to_chat_messages(request_without_history)
+
+
+def _responses_request_to_persisted_messages(request: ResponsesRequest) -> list[dict]:
+    """Persist replayable history for chained previous_response_id requests.
+
+    Responses `instructions` are intentionally not replayed across
+    `previous_response_id`, but replayable message items are.
+    """
+    messages: list[dict] = []
+    if request.previous_response_id:
+        previous = _responses_store.get(request.previous_response_id)
+        if previous is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Previous response `{request.previous_response_id}` not found",
+            )
+        messages.extend(copy.deepcopy(previous["messages"]))
+    messages.extend(_responses_request_to_new_persisted_messages(request))
+    return messages
+
+
+def _responses_request_to_chat_request(request: ResponsesRequest) -> ChatCompletionRequest:
+    """Build a ChatCompletionRequest from a ResponsesRequest."""
+    if request.text.format.type == "json_object":
+        raise HTTPException(
+            status_code=400,
+            detail="Responses text.format.type='json_object' is not supported on this backend",
+        )
+    if request.reasoning is not None:
+        logger.debug("Ignoring reasoning configuration (not supported on this backend)")
+
+    tools, unsupported_tools = _responses_tools_to_chat_tools(request.tools)
+    messages = _responses_input_to_chat_messages(request)
+    if unsupported_tools:
+        tool_list = ", ".join(sorted(set(unsupported_tools)))
+        messages.insert(
+            0,
+            {
+                "role": "system",
+                "content": (
+                    "The following requested tool types are not available on this "
+                    f"backend: {tool_list}. Do not call them."
+                ),
+            },
+        )
+
+    system_messages = [msg for msg in messages if msg.get("role") == "system"]
+    non_system_messages = [msg for msg in messages if msg.get("role") != "system"]
+    merged_system_content = "\n\n".join(
+        str(msg.get("content", "")).strip()
+        for msg in system_messages
+        if str(msg.get("content", "")).strip()
+    )
+    messages = (
+        [{"role": "system", "content": merged_system_content}]
+        if merged_system_content
+        else []
+    ) + non_system_messages
+
+    return ChatCompletionRequest(
+        model=request.model,
+        messages=[Message(**msg) for msg in messages],
+        temperature=request.temperature,
+        top_p=request.top_p,
+        max_tokens=request.max_output_tokens,
+        stream=False,
+        tools=tools,
+        tool_choice=request.tool_choice,
+    )
+
+
+def _build_responses_output_items(
+    text: str | None,
+    reasoning: str | None,
+    tool_calls: list[ToolCall] | None,
+) -> list[ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem]:
+    """Convert parsed assistant output into Responses API output items."""
+    output_items: list[
+        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+    ] = []
+
+    if reasoning:
+        output_items.append(
+            ResponseReasoningItem(
+                id=_new_response_item_id("rs"),
+                content=[ResponseReasoningTextPart(text=reasoning)],
+            )
+        )
+
+    if text:
+        output_items.append(
+            ResponseMessageItem(
+                id=_new_response_item_id("msg"),
+                role="assistant",
+                content=[ResponseTextContentPart(type="output_text", text=text)],
+            )
+        )
+
+    for tool_call in tool_calls or []:
+        output_items.append(
+            ResponseFunctionCallItem(
+                id=_new_response_item_id("fc"),
+                call_id=tool_call.id,
+                name=tool_call.function.name,
+                arguments=tool_call.function.arguments,
+            )
+        )
+
+    return output_items
+
+
+def _response_output_items_to_chat_messages(output_items: list) -> list[dict]:
+    """Persist assistant output in chat-completions form for previous_response_id."""
+    assistant_text_parts: list[str] = []
+    assistant_tool_calls: list[dict] = []
+
+    for item in output_items:
+        if isinstance(item, ResponseMessageItem):
+            assistant_text_parts.append(_response_content_to_text(item.content))
+        elif isinstance(item, ResponseFunctionCallItem):
+            assistant_tool_calls.append(
+                {
+                    "id": item.call_id,
+                    "type": "function",
+                    "function": {
+                        "name": item.name,
+                        "arguments": item.arguments,
+                    },
+                }
+            )
+
+    if not assistant_text_parts and not assistant_tool_calls:
+        return []
+
+    return [
+        {
+            "role": "assistant",
+            "content": "".join(assistant_text_parts),
+            "tool_calls": assistant_tool_calls or None,
+        }
+    ]
+
+
+def _build_response_object(
+    request: ResponsesRequest,
+    output_items: list[ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem],
+    prompt_tokens: int,
+    completion_tokens: int,
+    finish_reason: str | None,
+    response_id: str | None = None,
+) -> ResponseObject:
+    """Build a full Responses API object."""
+    response = ResponseObject(
+        id=response_id or _new_response_item_id("resp"),
+        model=_model_name or request.model,
+        instructions=request.instructions,
+        max_output_tokens=request.max_output_tokens,
+        metadata=request.metadata,
+        output=output_items,
+        parallel_tool_calls=request.parallel_tool_calls,
+        previous_response_id=request.previous_response_id,
+        text=request.text,
+        tool_choice=request.tool_choice,
+        tools=request.tools,
+        top_p=_resolve_top_p(request.top_p),
+        temperature=_resolve_temperature(request.temperature),
+        truncation=request.truncation,
+        user=request.user,
+        store=request.store,
+        usage=ResponsesUsage(
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+    )
+    if finish_reason == "length":
+        response.status = "incomplete"
+        response.incomplete_details = ResponseIncompleteDetails(
+            reason="max_output_tokens"
+        )
+    return response
+
+
+def _prepare_responses_request(
+    request: ResponsesRequest,
+) -> tuple[BaseEngine, ChatCompletionRequest, list[dict], dict, bool]:
+    """Prepare a Responses request for execution on the chat engine."""
+    _validate_model_name(request.model)
+    engine = get_engine()
+    chat_request = _responses_request_to_chat_request(request)
+
+    if chat_request.messages:
+        logger.info(
+            f"[REQUEST] POST /v1/responses stream={request.stream} "
+            f"model={request.model!r} items="
+            f"{len(request.input) if isinstance(request.input, list) else 1} "
+            f"tools={len(request.tools)}"
+        )
+
+    messages, images, videos = extract_multimodal_content(
+        chat_request.messages,
+        preserve_native_format=engine.preserve_native_tool_format,
+    )
+
+    chat_kwargs = {
+        "max_tokens": chat_request.max_tokens or _default_max_tokens,
+        "temperature": _resolve_temperature(chat_request.temperature),
+        "top_p": _resolve_top_p(chat_request.top_p),
+    }
+    if request.tools:
+        chat_kwargs["tools"] = convert_tools_for_template(chat_request.tools)
+    should_parse_tools = _apply_tool_choice(
+        chat_request.tool_choice, chat_kwargs, messages
+    )
+    if images:
+        chat_kwargs["images"] = images
+    if videos:
+        chat_kwargs["videos"] = videos
+
+    return engine, chat_request, messages, chat_kwargs, should_parse_tools
+
+
+async def _run_responses_request(
+    request: ResponsesRequest,
+    raw_request: Request,
+) -> tuple[ResponseObject | None, list[dict]]:
+    """Execute a Responses API request against the backend chat engine."""
+    engine, chat_request, messages, chat_kwargs, should_parse_tools = (
+        _prepare_responses_request(request)
+    )
+
+    timeout = _default_timeout
+    output = await _wait_with_disconnect(
+        engine.chat(messages=messages, **chat_kwargs),
+        raw_request,
+        timeout=timeout,
+    )
+    if output is None:
+        return None, []
+
+    cleaned_text, tool_calls = _parse_and_validate_tools(
+        output.text, chat_request, should_parse_tools
+    )
+    reasoning_text = None
+    if _reasoning_parser and not tool_calls:
+        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
+            cleaned_text or output.text
+        )
+
+    output_items = _build_responses_output_items(
+        clean_output_text(cleaned_text) if cleaned_text else None,
+        reasoning_text,
+        tool_calls,
+    )
+    response_object = _build_response_object(
+        request=request,
+        output_items=output_items,
+        prompt_tokens=output.prompt_tokens,
+        completion_tokens=output.completion_tokens,
+        finish_reason=output.finish_reason,
+    )
+
+    persisted_messages = _responses_request_to_persisted_messages(request)
+    persisted_messages.extend(_response_output_items_to_chat_messages(output_items))
+    if request.store:
+        _responses_store[response_object.id] = {
+            "messages": copy.deepcopy(persisted_messages),
+            "response": response_object.model_copy(deep=True),
+        }
+        while len(_responses_store) > _RESPONSES_STORE_MAX_SIZE:
+            _responses_store.popitem(last=False)
+
+    return response_object, persisted_messages
+
+
+async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[str]:
+    """Execute a Responses API request and stream SSE events incrementally."""
+    engine, chat_request, messages, chat_kwargs, should_parse_tools = (
+        _prepare_responses_request(request)
+    )
+
+    response_id = _new_response_item_id("resp")
+    sequence = 1
+    base_response = _build_response_object(
+        request=request,
+        output_items=[],
+        prompt_tokens=0,
+        completion_tokens=0,
+        finish_reason=None,
+        response_id=response_id,
+    )
+    base_response.status = "in_progress"
+    base_response.usage = None
+
+    yield _responses_sse_event(
+        "response.created",
+        ResponseCreatedEvent(sequence_number=sequence, response=base_response),
+    )
+    sequence += 1
+    yield _responses_sse_event(
+        "response.in_progress",
+        ResponseInProgressEvent(sequence_number=sequence, response=base_response),
+    )
+    sequence += 1
+
+    prompt_tokens = 0
+    completion_tokens = 0
+    finish_reason = None
+    last_output = None
+    raw_accumulated_text = ""
+    accumulated_text = ""
+    accumulated_reasoning = ""
+
+    text_item_id: str | None = None
+    text_output_index: int | None = None
+    reasoning_item_id: str | None = None
+    reasoning_output_index: int | None = None
+    next_output_index = 0
+
+    def _start_text_item() -> list[str]:
+        nonlocal text_item_id, text_output_index, next_output_index, sequence
+        events: list[str] = []
+        if text_item_id is None:
+            text_item_id = _new_response_item_id("msg")
+            text_output_index = next_output_index
+            next_output_index += 1
+            events.append(
+                _responses_sse_event(
+                    "response.output_item.added",
+                    ResponseOutputItemAddedEvent(
+                        sequence_number=sequence,
+                        output_index=text_output_index,
+                        item=ResponseMessageItem(
+                            id=text_item_id,
+                            role="assistant",
+                            status="in_progress",
+                            content=[],
+                        ),
+                    ),
+                )
+            )
+            sequence += 1
+            events.append(
+                _responses_sse_event(
+                    "response.content_part.added",
+                    ResponseContentPartAddedEvent(
+                        sequence_number=sequence,
+                        item_id=text_item_id,
+                        output_index=text_output_index,
+                        content_index=0,
+                        part=ResponseTextContentPart(type="output_text", text=""),
+                    ),
+                )
+            )
+            sequence += 1
+        return events
+
+    def _start_reasoning_item() -> list[str]:
+        nonlocal reasoning_item_id, reasoning_output_index, next_output_index, sequence
+        events: list[str] = []
+        if reasoning_item_id is None:
+            reasoning_item_id = _new_response_item_id("rs")
+            reasoning_output_index = next_output_index
+            next_output_index += 1
+            events.append(
+                _responses_sse_event(
+                    "response.output_item.added",
+                    ResponseOutputItemAddedEvent(
+                        sequence_number=sequence,
+                        output_index=reasoning_output_index,
+                        item=ResponseReasoningItem(
+                            id=reasoning_item_id,
+                            status="in_progress",
+                            content=[],
+                        ),
+                    ),
+                )
+            )
+            sequence += 1
+            events.append(
+                _responses_sse_event(
+                    "response.content_part.added",
+                    ResponseContentPartAddedEvent(
+                        sequence_number=sequence,
+                        item_id=reasoning_item_id,
+                        output_index=reasoning_output_index,
+                        content_index=0,
+                        part=ResponseReasoningTextPart(text=""),
+                    ),
+                )
+            )
+            sequence += 1
+        return events
+
+    if _reasoning_parser:
+        _reasoning_parser.reset_state()
+
+    global _tool_parser_instance
+    tool_parser = None
+    tool_accumulated_text = ""
+    tool_markup_possible = False
+    if should_parse_tools and _enable_auto_tool_choice and _tool_call_parser:
+        if _tool_parser_instance is None:
+            try:
+                parser_cls = ToolParserManager.get_tool_parser(_tool_call_parser)
+                tokenizer = None
+                if _engine is not None and hasattr(_engine, "_tokenizer"):
+                    tokenizer = _engine._tokenizer
+                _tool_parser_instance = parser_cls(tokenizer)
+                logger.info(
+                    "Initialized tool call parser for responses streaming: %s",
+                    _tool_call_parser,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to init tool parser for responses streaming: %s", e
+                )
+        if _tool_parser_instance is not None:
+            tool_parser = _tool_parser_instance
+            tool_parser.reset()
+
+    async for output in engine.stream_chat(messages=messages, **chat_kwargs):
+        last_output = output
+        finish_reason = output.finish_reason
+        if hasattr(output, "prompt_tokens") and output.prompt_tokens:
+            prompt_tokens = output.prompt_tokens
+        if hasattr(output, "completion_tokens") and output.completion_tokens:
+            completion_tokens = output.completion_tokens
+
+        delta_text = output.new_text or ""
+        if not delta_text:
+            continue
+
+        previous_text = raw_accumulated_text
+        raw_accumulated_text += delta_text
+
+        if _reasoning_parser:
+            delta_msg = _reasoning_parser.extract_reasoning_streaming(
+                previous_text, raw_accumulated_text, delta_text
+            )
+            if delta_msg is None:
+                continue
+
+            if delta_msg.reasoning:
+                for event in _start_reasoning_item():
+                    yield event
+                accumulated_reasoning += delta_msg.reasoning
+                yield _responses_sse_event(
+                    "response.reasoning_text.delta",
+                    ResponseReasoningTextDeltaEvent(
+                        sequence_number=sequence,
+                        item_id=reasoning_item_id,
+                        output_index=reasoning_output_index,
+                        content_index=0,
+                        delta=delta_msg.reasoning,
+                    ),
+                )
+                sequence += 1
+
+            if delta_msg.content:
+                for event in _start_text_item():
+                    yield event
+                accumulated_text += delta_msg.content
+                yield _responses_sse_event(
+                    "response.output_text.delta",
+                    ResponseOutputTextDeltaEvent(
+                        sequence_number=sequence,
+                        item_id=text_item_id,
+                        output_index=text_output_index,
+                        content_index=0,
+                        delta=delta_msg.content,
+                    ),
+                )
+                sequence += 1
+            continue
+
+        content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
+        if tool_parser and delta_text:
+            if not tool_markup_possible and not _looks_like_streaming_tool_markup(
+                delta_text
+            ):
+                tool_accumulated_text += delta_text
+            else:
+                if not tool_markup_possible:
+                    tool_markup_possible = True
+                tool_result = tool_parser.extract_tool_calls_streaming(
+                    tool_accumulated_text, tool_accumulated_text + delta_text, delta_text
+                )
+                tool_accumulated_text += delta_text
+                if tool_result is None:
+                    continue
+                if "tool_calls" in tool_result:
+                    continue
+                content = tool_result.get("content", "")
+
+        if not content:
+            continue
+
+        for event in _start_text_item():
+            yield event
+        accumulated_text += content
+        yield _responses_sse_event(
+            "response.output_text.delta",
+            ResponseOutputTextDeltaEvent(
+                sequence_number=sequence,
+                item_id=text_item_id,
+                output_index=text_output_index,
+                content_index=0,
+                delta=content,
+            ),
+        )
+        sequence += 1
+
+    cleaned_text, tool_calls = _parse_and_validate_tools(
+        raw_accumulated_text, chat_request, should_parse_tools
+    )
+    final_text = accumulated_text
+    if cleaned_text is not None and not final_text and not tool_calls:
+        final_text = clean_output_text(cleaned_text)
+
+    reasoning_item = None
+    if reasoning_item_id is not None:
+        reasoning_item = ResponseReasoningItem(
+            id=reasoning_item_id,
+            status="completed",
+            content=[ResponseReasoningTextPart(text=accumulated_reasoning)],
+        )
+        yield _responses_sse_event(
+            "response.reasoning_text.done",
+            ResponseReasoningTextDoneEvent(
+                sequence_number=sequence,
+                item_id=reasoning_item_id,
+                output_index=reasoning_output_index,
+                content_index=0,
+                text=accumulated_reasoning,
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.content_part.done",
+            ResponseContentPartDoneEvent(
+                sequence_number=sequence,
+                item_id=reasoning_item_id,
+                output_index=reasoning_output_index,
+                content_index=0,
+                part=reasoning_item.content[0],
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.output_item.done",
+            ResponseOutputItemDoneEvent(
+                sequence_number=sequence,
+                output_index=reasoning_output_index,
+                item=reasoning_item,
+            ),
+        )
+        sequence += 1
+
+    text_item = None
+    if text_item_id is not None or final_text:
+        if text_item_id is None:
+            for event in _start_text_item():
+                yield event
+        text_item = ResponseMessageItem(
+            id=text_item_id,
+            role="assistant",
+            status="completed",
+            content=[ResponseTextContentPart(type="output_text", text=final_text)],
+        )
+        yield _responses_sse_event(
+            "response.output_text.done",
+            ResponseOutputTextDoneEvent(
+                sequence_number=sequence,
+                item_id=text_item_id,
+                output_index=text_output_index,
+                content_index=0,
+                text=final_text,
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.content_part.done",
+            ResponseContentPartDoneEvent(
+                sequence_number=sequence,
+                item_id=text_item_id,
+                output_index=text_output_index,
+                content_index=0,
+                part=text_item.content[0],
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.output_item.done",
+            ResponseOutputItemDoneEvent(
+                sequence_number=sequence,
+                output_index=text_output_index,
+                item=text_item,
+            ),
+        )
+        sequence += 1
+
+    function_call_items: list[ResponseFunctionCallItem] = []
+    for tool_call in tool_calls or []:
+        output_index = next_output_index
+        next_output_index += 1
+        item = ResponseFunctionCallItem(
+            id=_new_response_item_id("fc"),
+            call_id=tool_call.id,
+            name=tool_call.function.name,
+            arguments=tool_call.function.arguments,
+        )
+        function_call_items.append(item)
+        yield _responses_sse_event(
+            "response.output_item.added",
+            ResponseOutputItemAddedEvent(
+                sequence_number=sequence,
+                output_index=output_index,
+                item=item.model_copy(update={"status": "in_progress"}),
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.function_call_arguments.delta",
+            ResponseFunctionCallArgumentsDeltaEvent(
+                sequence_number=sequence,
+                item_id=item.id,
+                output_index=output_index,
+                delta=item.arguments,
+            ),
+        )
+        sequence += 1
+        yield _responses_sse_event(
+            "response.output_item.done",
+            ResponseOutputItemDoneEvent(
+                sequence_number=sequence,
+                output_index=output_index,
+                item=item,
+            ),
+        )
+        sequence += 1
+
+    output_items: list[
+        ResponseMessageItem | ResponseReasoningItem | ResponseFunctionCallItem
+    ] = []
+    if reasoning_item is not None:
+        output_items.append(reasoning_item)
+    if text_item is not None:
+        output_items.append(text_item)
+    output_items.extend(function_call_items)
+
+    response_object = _build_response_object(
+        request=request,
+        output_items=output_items,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        finish_reason=finish_reason,
+        response_id=response_id,
+    )
+
+    if request.store and last_output is not None:
+        persisted_messages = _responses_request_to_persisted_messages(request)
+        persisted_messages.extend(_response_output_items_to_chat_messages(output_items))
+        _responses_store[response_object.id] = {
+            "messages": copy.deepcopy(persisted_messages),
+            "response": response_object.model_copy(deep=True),
+        }
+        while len(_responses_store) > _RESPONSES_STORE_MAX_SIZE:
+            _responses_store.popitem(last=False)
+
+    yield _responses_sse_event(
+        "response.completed",
+        ResponseCompletedEvent(sequence_number=sequence, response=response_object),
+    )
+
+
+def _responses_sse_event(event_type: str, payload: BaseModel | dict) -> str:
+    """Encode a Responses API SSE event."""
+    data = payload.model_dump_json() if isinstance(payload, BaseModel) else json.dumps(payload)
+    return f"event: {event_type}\ndata: {data}\n\n"
 def _detect_native_tool_support() -> bool:
     """
     Detect if the active tool parser supports native tool format.
@@ -2000,73 +3044,69 @@ async def stream_chat_completion(
                 # Skip this chunk (e.g., <think> token itself)
                 continue
 
-            content = delta_msg.content
-            reasoning = delta_msg.reasoning
-
-            # Tool call parsing on the content portion (fix: was
-            # previously unreachable because tool parser was in the
-            # else branch of this if/else)
-            if tool_parser and content:
-                if not tool_markup_possible and "<" not in content:
-                    tool_accumulated_text += content
-                else:
-                    if not tool_markup_possible:
-                        tool_markup_possible = True
-                    tool_previous = tool_accumulated_text
-                    tool_accumulated_text += content
+            # Route content through tool parser when both are active
+            emit_content = delta_msg.content
+            if tool_parser and emit_content:
+                tool_accumulated_text += emit_content
+                if tool_markup_possible or _looks_like_streaming_tool_markup(
+                    emit_content
+                ):
+                    tool_markup_possible = True
                     tool_result = tool_parser.extract_tool_calls_streaming(
-                        tool_previous, tool_accumulated_text, content
+                        tool_accumulated_text[: -len(emit_content)],
+                        tool_accumulated_text,
+                        emit_content,
                     )
 
                     if tool_result is None:
-                        # Inside tool markup — suppress content, keep reasoning
-                        content = None
+                        emit_content = None
                     elif "tool_calls" in tool_result:
+                        tool_call_complete = bool(tool_result.get("complete"))
                         tool_calls_detected = True
-                        chunk = ChatCompletionChunk(
+                        tc_chunk = ChatCompletionChunk(
                             id=response_id,
-                            model=request.model,
+                            model=_model_name,
                             choices=[
                                 ChatCompletionChunkChoice(
                                     delta=ChatCompletionChunkDelta(
-                                        reasoning=reasoning,
                                         tool_calls=tool_result["tool_calls"],
                                     ),
                                     finish_reason=(
-                                        "tool_calls" if output.finished else None
+                                        "tool_calls"
+                                        if (output.finished or tool_call_complete)
+                                        else None
                                     ),
                                 )
                             ],
-                            usage=get_usage(output) if output.finished else None,
+                            usage=(
+                                get_usage(output)
+                                if (output.finished or tool_call_complete)
+                                else None
+                            ),
                         )
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        yield f"data: {tc_chunk.model_dump_json()}\n\n"
+                        if tool_call_complete:
+                            break
                         continue
                     else:
-                        content = tool_result.get("content", "")
+                        emit_content = tool_result.get("content", emit_content)
 
-            # Skip if both content and reasoning are empty
-            if not content and not reasoning:
-                continue
-
-            chunk = ChatCompletionChunk(
-                id=response_id,
-                model=_model_name,
-                choices=[
-                    ChatCompletionChunkChoice(
-                        delta=ChatCompletionChunkDelta(
-                            content=content if content else None,
-                            reasoning=reasoning,
-                        ),
-                        finish_reason=(
-                            "tool_calls"
-                            if (output.finished and tool_calls_detected)
-                            else (output.finish_reason if output.finished else None)
-                        ),
-                    )
-                ],
-                usage=get_usage(output) if output.finished else None,
-            )
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            if emit_content or delta_msg.reasoning:
+                chunk = ChatCompletionChunk(
+                    id=response_id,
+                    model=_model_name,
+                    choices=[
+                        ChatCompletionChunkChoice(
+                            delta=ChatCompletionChunkDelta(
+                                content=emit_content,
+                                reasoning=delta_msg.reasoning,
+                            ),
+                            finish_reason=output.finish_reason if output.finished else None,
+                        )
+                    ],
+                    usage=get_usage(output) if output.finished else None,
+                )
+                yield f"data: {chunk.model_dump_json()}\n\n"
         else:
             # Standard path without reasoning parsing
             content = delta_text
@@ -2085,7 +3125,9 @@ async def stream_chat_completion(
                 # Fast path: skip full parsing until '<' is seen in the stream,
                 # which could start tool markup (e.g. <tool_call>). This avoids
                 # per-token string scanning on the growing accumulated text.
-                if not tool_markup_possible and "<" not in delta_text:
+                if not tool_markup_possible and not _looks_like_streaming_tool_markup(
+                    delta_text
+                ):
                     tool_accumulated_text += delta_text
                     # No tool markup yet, fall through to normal chunk emission
                 else:
@@ -2102,6 +3144,7 @@ async def stream_chat_completion(
                         continue
 
                     if "tool_calls" in tool_result:
+                        tool_call_complete = bool(tool_result.get("complete"))
                         # Emit structured tool calls
                         tool_calls_detected = True
                         chunk = ChatCompletionChunk(
@@ -2113,13 +3156,21 @@ async def stream_chat_completion(
                                         tool_calls=tool_result["tool_calls"]
                                     ),
                                     finish_reason=(
-                                        "tool_calls" if output.finished else None
+                                        "tool_calls"
+                                        if (output.finished or tool_call_complete)
+                                        else None
                                     ),
                                 )
                             ],
-                            usage=get_usage(output) if output.finished else None,
+                            usage=(
+                                get_usage(output)
+                                if (output.finished or tool_call_complete)
+                                else None
+                            ),
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
+                        if tool_call_complete:
+                            break
                         continue
 
                     # Normal content from tool parser
@@ -2144,16 +3195,14 @@ async def stream_chat_completion(
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
 
-    # Fallback: if tool parser accumulated text but never emitted tool_calls
-    # (e.g., </tool_call> never arrived - incomplete tool call)
-    if (
-        tool_parser
-        and tool_accumulated_text
-        and not tool_calls_detected
-        and "<tool_call>" in tool_accumulated_text
-    ):
-        result = tool_parser.extract_tool_calls(tool_accumulated_text)
-        if result.tools_called:
+    # Completion guard: if a stream ended with fully accumulated tool markup but
+    # the incremental parser never emitted, run one final validated parse over
+    # the complete tool text before returning.
+    if tool_parser and tool_accumulated_text and not tool_calls_detected:
+        _, fallback_tool_calls = _parse_and_validate_tools(
+            tool_accumulated_text, request, True
+        )
+        if fallback_tool_calls:
             tool_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=_model_name,
@@ -2163,14 +3212,14 @@ async def stream_chat_completion(
                             tool_calls=[
                                 {
                                     "index": i,
-                                    "id": tc["id"],
+                                    "id": tc.id,
                                     "type": "function",
                                     "function": {
-                                        "name": tc["name"],
-                                        "arguments": tc["arguments"],
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments,
                                     },
                                 }
-                                for i, tc in enumerate(result.tool_calls)
+                                for i, tc in enumerate(fallback_tool_calls)
                             ]
                         ),
                         finish_reason="tool_calls",

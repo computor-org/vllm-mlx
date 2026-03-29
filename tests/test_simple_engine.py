@@ -11,6 +11,10 @@ class TestSimpleEngineConcurrency:
     """Test SimpleEngine lock behavior with concurrent requests."""
 
     @pytest.fixture
+    def anyio_backend(self):
+        return "asyncio"
+
+    @pytest.fixture
     def mock_model(self):
         """Create a mock model that tracks concurrent calls."""
         model = MagicMock()
@@ -65,7 +69,7 @@ class TestSimpleEngineConcurrency:
         model.chat = MagicMock(side_effect=chat_side_effect)
         return model
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lock_prevents_concurrent_generate(self, mock_model):
         """Test that the lock prevents concurrent generate calls."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -89,7 +93,7 @@ class TestSimpleEngineConcurrency:
                 "The lock is not working correctly."
             )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_lock_prevents_concurrent_chat(self, mock_llm_model):
         """Test that the lock prevents concurrent chat calls."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -115,7 +119,57 @@ class TestSimpleEngineConcurrency:
                 "The lock is not working correctly."
             )
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
+    async def test_chat_with_tools_aggregates_streaming_path(self, mock_llm_model):
+        """Tool-enabled non-stream chat should use the streaming path."""
+        from vllm_mlx.engine.simple import SimpleEngine
+
+        async def fake_stream_chat(*args, **kwargs):
+            yield MagicMock(
+                text="partial",
+                tokens=[],
+                prompt_tokens=11,
+                completion_tokens=1,
+                finish_reason=None,
+                finished=False,
+            )
+            yield MagicMock(
+                text="<|im_end|><tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}</tool_call>",
+                tokens=[],
+                prompt_tokens=11,
+                completion_tokens=4,
+                finish_reason="stop",
+                finished=True,
+            )
+
+        with patch("vllm_mlx.engine.simple.is_mllm_model", return_value=False):
+            engine = SimpleEngine("test-model")
+            engine._model = mock_llm_model
+            engine._loaded = True
+            engine.stream_chat = fake_stream_chat  # type: ignore[method-assign]
+
+            output = await engine.chat(
+                messages=[{"role": "user", "content": "run pwd"}],
+                max_tokens=16,
+                tools=[
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "bash",
+                            "parameters": {"type": "object", "properties": {}},
+                        },
+                    }
+                ],
+            )
+
+            assert output.text.startswith("<|im_end|><tool_call>")
+            assert output.tokens == []
+            assert output.prompt_tokens == 11
+            assert output.completion_tokens == 4
+            assert output.finish_reason == "stop"
+            mock_llm_model.chat.assert_not_called()
+
+    @pytest.mark.anyio
     async def test_lock_serializes_stream_generate(self, mock_model):
         """Test that stream_generate uses the same lock as other methods."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -178,7 +232,7 @@ class TestSimpleEngineConcurrency:
             result = await stream_task
             assert len(result) == 3, f"Expected 3 chunks, got {len(result)}"
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_engine_initialization_creates_lock(self):
         """Test that SimpleEngine creates a lock on initialization."""
         from vllm_mlx.engine.simple import SimpleEngine
@@ -189,7 +243,7 @@ class TestSimpleEngineConcurrency:
             assert hasattr(engine, "_generation_lock")
             assert isinstance(engine._generation_lock, asyncio.Lock)
 
-    @pytest.mark.asyncio
+    @pytest.mark.anyio
     async def test_requests_complete_in_order(self, mock_model):
         """Test that concurrent requests complete (may be in any order due to lock)."""
         from vllm_mlx.engine.simple import SimpleEngine

@@ -15,6 +15,7 @@ the 'final' channel, stripping all structural tokens from API responses.
 import re
 
 from .base import DeltaMessage, ReasoningParser
+from .harmony_parser import HarmonyReasoningParser
 
 # Structural tokens that should be stripped from output
 _STRUCTURAL_TOKENS = re.compile(
@@ -68,6 +69,12 @@ class GptOssReasoningParser(ReasoningParser):
     Also handles extended format with constrain token:
         <|channel|>final <|constrain|>JSON<|message|>[content]<|return|>
     """
+
+    def __init__(self, tokenizer=None):
+        super().__init__(tokenizer)
+        # GPT-OSS streams the same Harmony channel tokens as the dedicated
+        # Harmony parser, including split channel markers across deltas.
+        self._stream_parser = HarmonyReasoningParser(tokenizer)
 
     def extract_reasoning(
         self,
@@ -124,41 +131,13 @@ class GptOssReasoningParser(ReasoningParser):
         Returns:
             DeltaMessage with reasoning and/or content, or None to skip.
         """
-        prev_phase = self._detect_phase(previous_text)
-        curr_phase = self._detect_phase(current_text)
+        return self._stream_parser.extract_reasoning_streaming(
+            previous_text, current_text, delta_text
+        )
 
-        # Phase changed — extract content after the new marker
-        if curr_phase != prev_phase and curr_phase in ("analysis", "final"):
-            after_marker = self._extract_content_after_marker_in_delta(
-                current_text, curr_phase
-            )
-            if after_marker:
-                after_marker = self._strip_return(after_marker)
-                if curr_phase == "analysis":
-                    return DeltaMessage(reasoning=after_marker)
-                else:
-                    return DeltaMessage(content=after_marker)
-            return None
-
-        # In a steady phase — emit delta directly
-        if curr_phase == "analysis":
-            cleaned = self._strip_return(delta_text)
-            # Skip structural tokens in the delta
-            if _STRUCTURAL_TOKENS.search(cleaned):
-                cleaned = _STRUCTURAL_TOKENS.sub("", cleaned)
-            if cleaned:
-                return DeltaMessage(reasoning=cleaned)
-            return None
-        elif curr_phase == "final":
-            cleaned = self._strip_return(delta_text)
-            if _STRUCTURAL_TOKENS.search(cleaned):
-                cleaned = _STRUCTURAL_TOKENS.sub("", cleaned)
-            if cleaned:
-                return DeltaMessage(content=cleaned)
-            return None
-
-        # init or transition phase — skip structural tokens
-        return None
+    def reset_state(self):
+        """Reset streaming state for a new request."""
+        self._stream_parser.reset_state()
 
     @staticmethod
     def _detect_phase(text: str) -> str:

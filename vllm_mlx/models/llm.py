@@ -231,6 +231,17 @@ class MLXLanguageModel:
                         should_stop = True
                         break
 
+            eos_token_ids = getattr(self.tokenizer, "eos_token_ids", None)
+            if eos_token_ids is None:
+                eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+                eos_token_ids = [] if eos_token_id is None else [eos_token_id]
+            elif isinstance(eos_token_ids, int):
+                eos_token_ids = [eos_token_ids]
+
+            response_token = getattr(response, "token", None)
+            if response_token is not None and response_token in set(eos_token_ids):
+                should_stop = True
+
             finished = should_stop or token_count >= max_tokens
             finish_reason = None
             if finished:

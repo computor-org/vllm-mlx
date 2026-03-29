@@ -453,6 +453,8 @@ class BatchedEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
+        preserve_raw_output = bool(kwargs.pop("preserve_raw_output", False))
+
         if self._is_mllm and self._mllm_scheduler:
             # Use MLLM scheduler for all requests when model is multimodal.
             # MLLM models only initialise the _mllm_scheduler (not _engine),
@@ -467,7 +469,11 @@ class BatchedEngine(BaseEngine):
             )
 
             return GenerationOutput(
-                text=clean_output_text(output.output_text),
+                text=(
+                    output.output_text
+                    if preserve_raw_output
+                    else clean_output_text(output.output_text)
+                ),
                 prompt_tokens=output.prompt_tokens,
                 completion_tokens=output.completion_tokens,
                 finish_reason=output.finish_reason,
@@ -488,7 +494,11 @@ class BatchedEngine(BaseEngine):
             sampling_params=sampling_params,
         )
 
-        text = clean_output_text(output.output_text)
+        text = (
+            output.output_text
+            if preserve_raw_output
+            else clean_output_text(output.output_text)
+        )
 
         return GenerationOutput(
             text=text,
@@ -635,6 +645,7 @@ class BatchedEngine(BaseEngine):
             top_p=top_p,
             images=all_images if all_images else None,
             videos=all_videos if all_videos else None,
+            preserve_raw_output=bool(tools),
             **kwargs,
         )
 

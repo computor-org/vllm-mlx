@@ -34,6 +34,11 @@ def _generate_tool_id() -> str:
     return f"call_{uuid.uuid4().hex[:8]}"
 
 
+def _same_tool_call(left: dict[str, str], right: dict[str, str]) -> bool:
+    """Return True when two parsed tool calls are semantically identical."""
+    return left["name"] == right["name"] and left["arguments"] == right["arguments"]
+
+
 # Pattern: <|channel|>commentary to=functions.tool_name ... <|call|>
 _COMMENTARY_BLOCK_PATTERN = re.compile(
     r"<\|channel\|>commentary\s+to=functions\.(\w+)"
@@ -82,26 +87,26 @@ class HarmonyToolParser(ToolParser):
 
             try:
                 arguments = json.loads(args_str)
-                tool_calls.append(
-                    {
-                        "id": _generate_tool_id(),
-                        "name": tool_name,
-                        "arguments": (
-                            json.dumps(arguments, ensure_ascii=False)
-                            if isinstance(arguments, dict)
-                            else str(arguments)
-                        ),
-                    }
-                )
+                parsed_call = {
+                    "id": _generate_tool_id(),
+                    "name": tool_name,
+                    "arguments": (
+                        json.dumps(arguments, ensure_ascii=False)
+                        if isinstance(arguments, dict)
+                        else str(arguments)
+                    ),
+                }
             except json.JSONDecodeError:
                 # Keep the raw arguments string
-                tool_calls.append(
-                    {
-                        "id": _generate_tool_id(),
-                        "name": tool_name,
-                        "arguments": args_str,
-                    }
-                )
+                parsed_call = {
+                    "id": _generate_tool_id(),
+                    "name": tool_name,
+                    "arguments": args_str,
+                }
+
+            if tool_calls and _same_tool_call(parsed_call, tool_calls[-1]):
+                continue
+            tool_calls.append(parsed_call)
 
         # Extract final channel content
         final_match = _FINAL_BLOCK_PATTERN.search(model_output)
@@ -143,13 +148,16 @@ class HarmonyToolParser(ToolParser):
         channel content as regular content deltas.
         """
         # If we see a tool call completion marker in the delta
-        if "<|call|>" in delta_text:
-            result = self.extract_tool_calls(current_text)
-            if result.tools_called:
+        if "<|call|>" in current_text:
+            previous_result = self.extract_tool_calls(previous_text)
+            current_result = self.extract_tool_calls(current_text)
+            new_tool_calls = current_result.tool_calls[len(previous_result.tool_calls) :]
+            if new_tool_calls:
                 return {
+                    "complete": True,
                     "tool_calls": [
                         {
-                            "index": i,
+                            "index": len(previous_result.tool_calls) + i,
                             "id": tc["id"],
                             "type": "function",
                             "function": {
@@ -157,7 +165,7 @@ class HarmonyToolParser(ToolParser):
                                 "arguments": tc["arguments"],
                             },
                         }
-                        for i, tc in enumerate(result.tool_calls)
+                        for i, tc in enumerate(new_tool_calls)
                     ]
                 }
 
