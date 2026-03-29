@@ -512,6 +512,48 @@ class TestResponsesEndpoint:
         assert len(engine._stream_calls) == 1
         engine.chat.assert_not_awaited()
 
+    def test_streaming_tool_response_repairs_invalid_tool_before_emitting(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(
+            _output('<tool_call>{"name":"send_input","arguments":{"text":"oops"}}</tool_call>'),
+            _output('<tool_call>{"name":"shell","arguments":{"cmd":"pwd"}}</tool_call>'),
+        )
+        engine.stream_chat = AsyncMock(
+            side_effect=AssertionError("tool-enabled buffered stream should not call stream_chat")
+        )
+        srv._engine = engine
+
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Use a tool",
+                "stream": True,
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "shell",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+        ) as resp:
+            body = "".join(resp.iter_text())
+
+        assert resp.status_code == 200
+        assert "event: response.created" in body
+        assert "event: response.function_call_arguments.delta" in body
+        assert "event: response.completed" in body
+        assert "send_input" not in body
+        assert '"name":"shell"' in body or '"name": "shell"' in body
+        assert engine.chat.await_count == 2
+        retry_messages = engine.chat.await_args_list[1].kwargs["messages"]
+        assert retry_messages[-1]["role"] == "tool"
+        assert '"error_type": "unknown_tool"' in retry_messages[-1]["content"]
+        engine.stream_chat.assert_not_awaited()
+
     def test_json_object_response_format_is_rejected(self, client):
         import vllm_mlx.server as srv
 

@@ -764,6 +764,11 @@ async def _run_chat_with_invalid_tool_repair(
     return None
 
 
+def _should_buffer_tool_stream(should_parse_tools: bool, tools: list | None) -> bool:
+    """Tool-enabled streaming needs a completed turn before validation/repair."""
+    return bool(should_parse_tools and tools)
+
+
 def _set_tool_grammar_processor(chat_kwargs: dict, tools: list) -> None:
     """Attach an Outlines grammar-constrained logits processor for tool calls.
 
@@ -1405,7 +1410,243 @@ async def _run_responses_request(
     return response_object, persisted_messages
 
 
-async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[str]:
+async def _stream_responses_buffered(
+    request: ResponsesRequest,
+    raw_request: Request,
+    response_id: str,
+    initial_sequence: int,
+    engine: BaseEngine,
+    chat_request: ChatCompletionRequest,
+    messages: list[dict],
+    chat_kwargs: dict,
+    should_parse_tools: bool,
+) -> AsyncIterator[str]:
+    """Stream a fully validated/repaired Responses turn once it is complete."""
+    sequence = initial_sequence
+    execution = await _run_chat_with_invalid_tool_repair(
+        engine=engine,
+        messages=messages,
+        request=chat_request,
+        raw_request=raw_request,
+        chat_kwargs=chat_kwargs,
+        should_parse_tools=should_parse_tools,
+        endpoint="responses",
+        timeout=_default_timeout,
+    )
+    if execution is None:
+        return
+
+    next_output_index = 0
+    output_items = _build_responses_output_items(
+        (
+            clean_output_text(execution.parsed.cleaned_text)
+            if execution.parsed.cleaned_text
+            else None
+        ),
+        execution.parsed.reasoning_text,
+        execution.parsed.valid_tool_calls,
+    )
+
+    for item in output_items:
+        output_index = next_output_index
+        next_output_index += 1
+        if isinstance(item, ResponseReasoningItem):
+            in_progress = item.model_copy(update={"status": "in_progress", "content": []})
+            yield _responses_sse_event(
+                "response.output_item.added",
+                ResponseOutputItemAddedEvent(
+                    sequence_number=sequence,
+                    output_index=output_index,
+                    item=in_progress,
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.content_part.added",
+                ResponseContentPartAddedEvent(
+                    sequence_number=sequence,
+                    item_id=item.id,
+                    output_index=output_index,
+                    content_index=0,
+                    part=ResponseReasoningTextPart(text=""),
+                ),
+            )
+            sequence += 1
+            reasoning_text = item.content[0].text if item.content else ""
+            yield _responses_sse_event(
+                "response.reasoning_text.delta",
+                ResponseReasoningTextDeltaEvent(
+                    sequence_number=sequence,
+                    item_id=item.id,
+                    output_index=output_index,
+                    content_index=0,
+                    delta=reasoning_text,
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.reasoning_text.done",
+                ResponseReasoningTextDoneEvent(
+                    sequence_number=sequence,
+                    item_id=item.id,
+                    output_index=output_index,
+                    content_index=0,
+                    text=reasoning_text,
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.content_part.done",
+                ResponseContentPartDoneEvent(
+                    sequence_number=sequence,
+                    item_id=item.id,
+                    output_index=output_index,
+                    content_index=0,
+                    part=item.content[0],
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.output_item.done",
+                ResponseOutputItemDoneEvent(
+                    sequence_number=sequence,
+                    output_index=output_index,
+                    item=item,
+                ),
+            )
+            sequence += 1
+            continue
+
+        if isinstance(item, ResponseMessageItem):
+            in_progress = item.model_copy(update={"status": "in_progress", "content": []})
+            yield _responses_sse_event(
+                "response.output_item.added",
+                ResponseOutputItemAddedEvent(
+                    sequence_number=sequence,
+                    output_index=output_index,
+                    item=in_progress,
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.content_part.added",
+                ResponseContentPartAddedEvent(
+                    sequence_number=sequence,
+                    item_id=item.id,
+                    output_index=output_index,
+                    content_index=0,
+                    part=ResponseTextContentPart(type="output_text", text=""),
+                ),
+            )
+            sequence += 1
+            text = _response_content_to_text(item.content)
+            yield _responses_sse_event(
+                "response.output_text.delta",
+                ResponseOutputTextDeltaEvent(
+                    sequence_number=sequence,
+                    item_id=item.id,
+                    output_index=output_index,
+                    content_index=0,
+                    delta=text,
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.output_text.done",
+                ResponseOutputTextDoneEvent(
+                    sequence_number=sequence,
+                    item_id=item.id,
+                    output_index=output_index,
+                    content_index=0,
+                    text=text,
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.content_part.done",
+                ResponseContentPartDoneEvent(
+                    sequence_number=sequence,
+                    item_id=item.id,
+                    output_index=output_index,
+                    content_index=0,
+                    part=item.content[0],
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.output_item.done",
+                ResponseOutputItemDoneEvent(
+                    sequence_number=sequence,
+                    output_index=output_index,
+                    item=item,
+                ),
+            )
+            sequence += 1
+            continue
+
+        if isinstance(item, ResponseFunctionCallItem):
+            in_progress = item.model_copy(update={"status": "in_progress"})
+            yield _responses_sse_event(
+                "response.output_item.added",
+                ResponseOutputItemAddedEvent(
+                    sequence_number=sequence,
+                    output_index=output_index,
+                    item=in_progress,
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.function_call_arguments.delta",
+                ResponseFunctionCallArgumentsDeltaEvent(
+                    sequence_number=sequence,
+                    item_id=item.id,
+                    output_index=output_index,
+                    delta=item.arguments,
+                ),
+            )
+            sequence += 1
+            yield _responses_sse_event(
+                "response.output_item.done",
+                ResponseOutputItemDoneEvent(
+                    sequence_number=sequence,
+                    output_index=output_index,
+                    item=item,
+                ),
+            )
+            sequence += 1
+
+    response_object = _build_response_object(
+        request=request,
+        output_items=output_items,
+        prompt_tokens=execution.total_prompt_tokens,
+        completion_tokens=execution.total_completion_tokens,
+        finish_reason=(
+            "tool_calls"
+            if execution.parsed.valid_tool_calls
+            else execution.output.finish_reason
+        ),
+        response_id=response_id,
+    )
+    if request.store:
+        persisted_messages = _responses_request_to_persisted_messages(request)
+        persisted_messages.extend(_response_output_items_to_chat_messages(output_items))
+        _responses_store[response_object.id] = {
+            "messages": copy.deepcopy(persisted_messages),
+            "response": response_object.model_copy(deep=True),
+        }
+        while len(_responses_store) > _RESPONSES_STORE_MAX_SIZE:
+            _responses_store.popitem(last=False)
+
+    yield _responses_sse_event(
+        "response.completed",
+        ResponseCompletedEvent(sequence_number=sequence, response=response_object),
+    )
+
+
+async def _stream_responses_request(
+    request: ResponsesRequest,
+    raw_request: Request,
+) -> AsyncIterator[str]:
     """Execute a Responses API request and stream SSE events incrementally."""
     engine, chat_request, messages, chat_kwargs, should_parse_tools = (
         _prepare_responses_request(request)
@@ -1434,6 +1675,21 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
         ResponseInProgressEvent(sequence_number=sequence, response=base_response),
     )
     sequence += 1
+
+    if _should_buffer_tool_stream(should_parse_tools, request.tools):
+        async for event in _stream_responses_buffered(
+            request=request,
+            raw_request=raw_request,
+            response_id=response_id,
+            initial_sequence=sequence,
+            engine=engine,
+            chat_request=chat_request,
+            messages=messages,
+            chat_kwargs=chat_kwargs,
+            should_parse_tools=should_parse_tools,
+        ):
+            yield event
+        return
 
     prompt_tokens = 0
     completion_tokens = 0
@@ -2923,7 +3179,7 @@ async def create_response(request: ResponsesRequest, raw_request: Request):
     """Create a Responses API response."""
     if request.stream:
         return StreamingResponse(
-            _disconnect_guard(_stream_responses_request(request), raw_request),
+            _disconnect_guard(_stream_responses_request(request, raw_request), raw_request),
             media_type="text/event-stream",
         )
 
