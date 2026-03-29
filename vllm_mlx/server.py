@@ -193,6 +193,15 @@ _responses_store: OrderedDict[str, dict] = OrderedDict()
 _RESPONSES_STORE_MAX_SIZE: int = 1000
 
 
+def _looks_like_streaming_tool_markup(delta_text: str) -> bool:
+    """Cheap trigger check before invoking streaming tool parsers."""
+    return (
+        "<" in delta_text
+        or "[TOOL_CALLS]" in delta_text
+        or "[Calling tool:" in delta_text
+    )
+
+
 def _load_prefix_cache_from_disk() -> None:
     """Load prefix cache from disk during startup."""
     try:
@@ -1307,7 +1316,9 @@ async def _stream_responses_request(request: ResponsesRequest) -> AsyncIterator[
 
         content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
         if tool_parser and delta_text:
-            if not tool_markup_possible and "<" not in delta_text:
+            if not tool_markup_possible and not _looks_like_streaming_tool_markup(
+                delta_text
+            ):
                 tool_accumulated_text += delta_text
             else:
                 if not tool_markup_possible:
@@ -3195,7 +3206,9 @@ async def stream_chat_completion(
             emit_content = delta_msg.content
             if tool_parser and emit_content:
                 tool_accumulated_text += emit_content
-                if tool_markup_possible or "<" in emit_content:
+                if tool_markup_possible or _looks_like_streaming_tool_markup(
+                    emit_content
+                ):
                     tool_markup_possible = True
                     tool_result = tool_parser.extract_tool_calls_streaming(
                         tool_accumulated_text[: -len(emit_content)],
@@ -3205,6 +3218,7 @@ async def stream_chat_completion(
                     if tool_result is None:
                         emit_content = None
                     elif "tool_calls" in tool_result:
+                        tool_call_complete = bool(tool_result.get("complete"))
                         tool_calls_detected = True
                         tc_chunk = ChatCompletionChunk(
                             id=response_id,
@@ -3214,12 +3228,22 @@ async def stream_chat_completion(
                                     delta=ChatCompletionChunkDelta(
                                         tool_calls=tool_result["tool_calls"],
                                     ),
-                                    finish_reason="tool_calls" if output.finished else None,
+                                    finish_reason=(
+                                        "tool_calls"
+                                        if (output.finished or tool_call_complete)
+                                        else None
+                                    ),
                                 )
                             ],
-                            usage=get_usage(output) if output.finished else None,
+                            usage=(
+                                get_usage(output)
+                                if (output.finished or tool_call_complete)
+                                else None
+                            ),
                         )
                         yield f"data: {tc_chunk.model_dump_json()}\n\n"
+                        if tool_call_complete:
+                            break
                         continue
                     else:
                         emit_content = tool_result.get("content", emit_content)
@@ -3258,7 +3282,9 @@ async def stream_chat_completion(
                 # Fast path: skip full parsing until '<' is seen in the stream,
                 # which could start tool markup (e.g. <tool_call>). This avoids
                 # per-token string scanning on the growing accumulated text.
-                if not tool_markup_possible and "<" not in delta_text:
+                if not tool_markup_possible and not _looks_like_streaming_tool_markup(
+                    delta_text
+                ):
                     tool_accumulated_text += delta_text
                     # No tool markup yet, fall through to normal chunk emission
                 else:
@@ -3275,6 +3301,7 @@ async def stream_chat_completion(
                         continue
 
                     if "tool_calls" in tool_result:
+                        tool_call_complete = bool(tool_result.get("complete"))
                         # Emit structured tool calls
                         tool_calls_detected = True
                         chunk = ChatCompletionChunk(
@@ -3286,13 +3313,21 @@ async def stream_chat_completion(
                                         tool_calls=tool_result["tool_calls"]
                                     ),
                                     finish_reason=(
-                                        "tool_calls" if output.finished else None
+                                        "tool_calls"
+                                        if (output.finished or tool_call_complete)
+                                        else None
                                     ),
                                 )
                             ],
-                            usage=get_usage(output) if output.finished else None,
+                            usage=(
+                                get_usage(output)
+                                if (output.finished or tool_call_complete)
+                                else None
+                            ),
                         )
                         yield f"data: {chunk.model_dump_json()}\n\n"
+                        if tool_call_complete:
+                            break
                         continue
 
                     # Normal content from tool parser
@@ -3317,31 +3352,14 @@ async def stream_chat_completion(
             )
             yield f"data: {chunk.model_dump_json()}\n\n"
 
-    # Fallback: if tool parser accumulated text but never emitted tool_calls
-    # (e.g., </tool_call> never arrived - incomplete tool call)
-    if (
-        tool_parser
-        and tool_accumulated_text
-        and not tool_calls_detected
-        and "<tool_call>" in tool_accumulated_text
-    ):
-        result = tool_parser.extract_tool_calls(tool_accumulated_text)
-        if result.tools_called:
-            # Convert raw dicts to ToolCall objects for validation
-            fallback_tool_calls = [
-                ToolCall(
-                    id=tc["id"],
-                    type="function",
-                    function=FunctionCall(
-                        name=tc["name"], arguments=tc["arguments"]
-                    ),
-                )
-                for tc in result.tool_calls
-            ]
-            fallback_tool_calls = _validate_tool_calls(
-                fallback_tool_calls, request.tools
-            )
-        if result.tools_called and fallback_tool_calls:
+    # Completion guard: if a stream ended with fully accumulated tool markup but
+    # the incremental parser never emitted, run one final validated parse over
+    # the complete tool text before returning.
+    if tool_parser and tool_accumulated_text and not tool_calls_detected:
+        _, fallback_tool_calls = _parse_and_validate_tools(
+            tool_accumulated_text, request, True
+        )
+        if fallback_tool_calls:
             tool_chunk = ChatCompletionChunk(
                 id=response_id,
                 model=_model_name,

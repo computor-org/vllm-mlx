@@ -50,6 +50,8 @@ class HarmonyReasoningParser(ReasoningParser):
         super().__init__(tokenizer)
         self._current_channel: str | None = None
         self._in_message: bool = False
+        self._pending_channel_text = ""
+        self._collecting_channel = False
 
     def extract_reasoning(
         self,
@@ -97,31 +99,34 @@ class HarmonyReasoningParser(ReasoningParser):
         Returns:
             DeltaMessage with reasoning and/or content, or None.
         """
+        if self._collecting_channel:
+            self._pending_channel_text += delta_text
+            resolved = self._try_resolve_pending_channel()
+            if resolved is not None:
+                return resolved
+
         # Detect channel switches in the delta
         if "<|channel|>" in delta_text:
-            if "analysis" in delta_text:
-                self._current_channel = "analysis"
-                self._in_message = False
-                return None
-            elif "final" in delta_text:
-                self._current_channel = "final"
-                self._in_message = False
-                return None
-            elif "commentary" in delta_text:
-                self._current_channel = "commentary"
-                self._in_message = False
-                return None
+            self._collecting_channel = True
+            self._pending_channel_text = delta_text
+            resolved = self._try_resolve_pending_channel()
+            if resolved is not None:
+                return resolved
+            return None
 
         # Detect channel from full context if not yet determined
         if self._current_channel is None and "<|channel|>" in current_text:
             last_channel = current_text.rfind("<|channel|>")
             after = current_text[last_channel + len("<|channel|>") :]
-            if after.startswith("analysis"):
-                self._current_channel = "analysis"
-            elif after.startswith("final"):
-                self._current_channel = "final"
-            elif after.startswith("commentary"):
-                self._current_channel = "commentary"
+            self._current_channel = self._resolve_channel_name(after)
+
+        # Commentary is routed through the tool parser via DeltaMessage.content.
+        if self._current_channel == "commentary":
+            if "<|message|>" in delta_text:
+                self._in_message = True
+            if any(token in delta_text for token in ("<|call|>", "<|end|>", "<|return|>")):
+                self._in_message = False
+            return DeltaMessage(content=delta_text)
 
         # Handle message start
         if "<|message|>" in delta_text:
@@ -155,3 +160,40 @@ class HarmonyReasoningParser(ReasoningParser):
         """Reset streaming state for a new request."""
         self._current_channel = None
         self._in_message = False
+        self._pending_channel_text = ""
+        self._collecting_channel = False
+
+    @staticmethod
+    def _resolve_channel_name(text: str) -> str | None:
+        """Extract the active Harmony channel name from a delta or suffix."""
+        if "analysis" in text:
+            return "analysis"
+        if "final" in text:
+            return "final"
+        if "commentary" in text:
+            return "commentary"
+        return None
+
+    def _try_resolve_pending_channel(self) -> DeltaMessage | None:
+        """Resolve a partially streamed channel header once enough text arrives."""
+        suffix = self._pending_channel_text.split("<|channel|>", 1)[-1]
+        channel_name = self._resolve_channel_name(suffix)
+        if channel_name is None:
+            return None
+
+        buffered = self._pending_channel_text
+        self._pending_channel_text = ""
+        self._collecting_channel = False
+        self._current_channel = channel_name
+        self._in_message = "<|message|>" in buffered
+
+        if channel_name == "commentary":
+            return DeltaMessage(content=buffered)
+
+        if "<|message|>" in buffered:
+            content = buffered.split("<|message|>", 1)[1]
+            if content:
+                if channel_name == "analysis":
+                    return DeltaMessage(reasoning=content)
+                return DeltaMessage(content=content)
+        return None

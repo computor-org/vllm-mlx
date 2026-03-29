@@ -185,6 +185,24 @@ class TestQwenToolParser:
         assert result.tools_called
         assert len(result.tool_calls) == 2
 
+    def test_function_parameter_format(self, parser):
+        """Test parsing Qwen's function/parameter XML format."""
+        text = (
+            "<tool_call>\n"
+            "<function=get_weather>\n"
+            "<parameter=city>Paris</parameter>\n"
+            "<parameter=days>3</parameter>\n"
+            "</function>\n"
+            "</tool_call>"
+        )
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args == {"city": "Paris", "days": 3}
+
     def test_no_tool_call(self, parser):
         """Test text without tool calls."""
         text = "I can help you with that question."
@@ -680,6 +698,20 @@ class TestStreamingParsing:
             delta_text="Hello world",
         )
         assert result == {"content": "Hello world"}
+
+    def test_qwen_streaming_split_closing_tag(self):
+        """Qwen streaming should finish on accumulated text, not lucky final deltas."""
+        parser = QwenToolParser()
+
+        r = parser.extract_tool_calls_streaming(
+            previous_text="<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call",
+            current_text="<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>",
+            delta_text=">",
+        )
+
+        assert r is not None
+        assert "tool_calls" in r
+        assert r["tool_calls"][0]["function"]["name"] == "get_weather"
 
 
 class TestThinkTagStripping:

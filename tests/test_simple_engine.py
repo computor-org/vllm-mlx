@@ -162,7 +162,7 @@ class TestSimpleEngineConcurrency:
                 ],
             )
 
-            assert output.text.startswith("<tool_call>")
+            assert output.text.startswith("<|im_end|><tool_call>")
             assert output.tokens == []
             assert output.prompt_tokens == 11
             assert output.completion_tokens == 4
