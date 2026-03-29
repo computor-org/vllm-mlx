@@ -135,6 +135,17 @@ class TestMistralToolParser:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0]["name"] == "get_weather"
 
+    def test_new_format_with_args_suffix_and_token_markers(self, parser):
+        """Devstral emits [ARGS] plus tokenizer-space markers in JSON."""
+        text = '[TOOL_CALLS]get_weather[ARGS]{"city":Ġ"Paris"}'
+        result = parser.extract_tool_calls(text)
+
+        assert result.tools_called
+        assert len(result.tool_calls) == 1
+        assert result.tool_calls[0]["name"] == "get_weather"
+        args = json.loads(result.tool_calls[0]["arguments"])
+        assert args["city"] == "Paris"
+
     def test_no_tool_call(self, parser):
         """Test that regular text is not parsed as tool call."""
         text = "Hello, how can I help you today?"

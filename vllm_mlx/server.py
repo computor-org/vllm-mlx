@@ -50,6 +50,7 @@ import time
 import uuid
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 
 import jsonschema
 import uvicorn
@@ -496,8 +497,271 @@ def _parse_and_validate_tools(
         return output_text, None
     cleaned, tool_calls = _parse_tool_calls_with_parser(output_text, request)
     if tool_calls:
-        tool_calls = _validate_tool_calls(tool_calls, request.tools)
+        tool_calls = _validate_tool_calls(tool_calls, request.tools).valid_tool_calls
     return cleaned, tool_calls
+
+
+@dataclass
+class InvalidToolCall:
+    """Parsed tool call that failed semantic validation."""
+
+    tool_call: ToolCall
+    error_type: str
+    message: str
+    available_tools: list[str]
+    validation_detail: str | None = None
+
+    @property
+    def call_id(self) -> str:
+        return self.tool_call.id
+
+    @property
+    def tool_name(self) -> str:
+        return self.tool_call.function.name
+
+    @property
+    def raw_arguments(self) -> str:
+        return self.tool_call.function.arguments
+
+
+@dataclass
+class ToolValidationResult:
+    """Semantic validation result for parsed tool calls."""
+
+    valid_tool_calls: list[ToolCall] | None
+    invalid_tool_calls: list[InvalidToolCall] = field(default_factory=list)
+
+
+@dataclass
+class ParsedAssistantTurn:
+    """Normalized assistant turn after parsing, validation, and reasoning split."""
+
+    raw_text: str
+    cleaned_text: str | None
+    reasoning_text: str | None
+    tool_validation: ToolValidationResult
+
+    @property
+    def valid_tool_calls(self) -> list[ToolCall] | None:
+        return self.tool_validation.valid_tool_calls
+
+    @property
+    def invalid_tool_calls(self) -> list[InvalidToolCall]:
+        return self.tool_validation.invalid_tool_calls
+
+
+@dataclass
+class ChatExecutionResult:
+    """Final execution result after optional invalid-tool repair."""
+
+    output: GenerationOutput
+    parsed: ParsedAssistantTurn
+    total_prompt_tokens: int
+    total_completion_tokens: int
+    repaired: bool = False
+
+
+def _declared_tools_by_name(
+    tools: list[ToolDefinition] | list[dict] | None,
+) -> dict[str, dict | None]:
+    """Build a mapping from declared tool name to parameters schema."""
+    if tools is None:
+        return {}
+
+    tools_by_name: dict[str, dict | None] = {}
+    for tool in tools:
+        func = (
+            tool.function
+            if isinstance(tool, ToolDefinition)
+            else (tool.get("function") if isinstance(tool, dict) else None)
+        )
+        if not isinstance(func, dict):
+            continue
+        name = func.get("name")
+        if name:
+            tools_by_name[name] = func.get("parameters")
+    return tools_by_name
+
+
+def _format_invalid_tool_message(
+    error_type: str,
+    tool_name: str,
+    available_tools: list[str],
+) -> str:
+    """Create a compact natural-language explanation for a rejected tool call."""
+    if error_type == "unknown_tool":
+        if available_tools:
+            return (
+                f"Tool {tool_name!r} is not available. "
+                f"Use one of: {', '.join(available_tools)}."
+            )
+        return f"Tool {tool_name!r} is not available for this request."
+    if error_type == "invalid_arguments_json":
+        return f"Tool {tool_name!r} was called with malformed JSON arguments."
+    return f"Tool {tool_name!r} was called with arguments that do not match its schema."
+
+
+def _tool_call_to_message_dict(tool_call: ToolCall) -> dict:
+    """Convert a ToolCall into the OpenAI chat-history wire shape."""
+    return {
+        "id": tool_call.id,
+        "type": tool_call.type,
+        "function": {
+            "name": tool_call.function.name,
+            "arguments": tool_call.function.arguments,
+        },
+    }
+
+
+def _build_invalid_tool_error_payload(invalid_call: InvalidToolCall) -> str:
+    """Build a canonical JSON error payload for synthetic tool_result messages."""
+    payload = {
+        "error": "invalid_tool_call",
+        "error_type": invalid_call.error_type,
+        "message": invalid_call.message,
+        "tool_name": invalid_call.tool_name,
+        "available_tools": invalid_call.available_tools,
+        "raw_arguments": invalid_call.raw_arguments,
+    }
+    if invalid_call.validation_detail:
+        payload["detail"] = invalid_call.validation_detail
+    return json.dumps(payload, ensure_ascii=True, sort_keys=True)
+
+
+def _parse_assistant_turn(
+    output_text: str,
+    request: ChatCompletionRequest,
+    should_parse_tools: bool,
+) -> ParsedAssistantTurn:
+    """Parse one completed assistant turn into normalized server-side state."""
+    if should_parse_tools:
+        cleaned_text, parsed_tool_calls = _parse_tool_calls_with_parser(
+            output_text, request
+        )
+        validation = _validate_tool_calls(parsed_tool_calls, request.tools)
+    else:
+        cleaned_text = output_text
+        validation = ToolValidationResult(valid_tool_calls=None)
+
+    reasoning_text = None
+    if _reasoning_parser and not validation.valid_tool_calls:
+        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
+            cleaned_text or output_text
+        )
+
+    return ParsedAssistantTurn(
+        raw_text=output_text,
+        cleaned_text=cleaned_text,
+        reasoning_text=reasoning_text,
+        tool_validation=validation,
+    )
+
+
+def _should_attempt_invalid_tool_repair(parsed: ParsedAssistantTurn) -> bool:
+    """Only repair turns that contain invalid tool calls and no valid ones."""
+    return bool(parsed.invalid_tool_calls) and not parsed.valid_tool_calls
+
+
+def _build_invalid_tool_repair_messages(parsed: ParsedAssistantTurn) -> list[dict]:
+    """Build synthetic assistant/tool messages that tell the model what failed."""
+    assistant_message = {
+        "role": "assistant",
+        "content": parsed.cleaned_text or "",
+        "tool_calls": [
+            _tool_call_to_message_dict(invalid.tool_call)
+            for invalid in parsed.invalid_tool_calls
+        ],
+    }
+    tool_messages = [
+        {
+            "role": "tool",
+            "tool_call_id": invalid.call_id,
+            "content": _build_invalid_tool_error_payload(invalid),
+        }
+        for invalid in parsed.invalid_tool_calls
+    ]
+    return [assistant_message, *tool_messages]
+
+
+def _log_invalid_tool_calls(
+    endpoint: str,
+    invalid_tool_calls: list[InvalidToolCall],
+    *,
+    action: str,
+) -> None:
+    """Emit explicit server logs for invalid tool-call handling."""
+    parser_name = _tool_call_parser or "generic"
+    for invalid in invalid_tool_calls:
+        logger.warning(
+            "Invalid tool call %s on %s endpoint: parser=%s tool=%s error_type=%s detail=%s",
+            action,
+            endpoint,
+            parser_name,
+            invalid.tool_name,
+            invalid.error_type,
+            invalid.validation_detail or invalid.message,
+        )
+
+
+async def _run_chat_with_invalid_tool_repair(
+    *,
+    engine: BaseEngine,
+    messages: list[dict],
+    request: ChatCompletionRequest,
+    raw_request: Request,
+    chat_kwargs: dict,
+    should_parse_tools: bool,
+    endpoint: str,
+    timeout: float,
+) -> ChatExecutionResult | None:
+    """Run one chat request, allowing a single internal repair turn on invalid tools."""
+    current_messages = copy.deepcopy(messages)
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    repaired = False
+
+    for attempt in range(2):
+        output = await _wait_with_disconnect(
+            engine.chat(messages=current_messages, **chat_kwargs),
+            raw_request,
+            timeout=timeout,
+        )
+        if output is None:
+            return None
+
+        total_prompt_tokens += getattr(output, "prompt_tokens", 0) or 0
+        total_completion_tokens += getattr(output, "completion_tokens", 0) or 0
+        parsed = _parse_assistant_turn(output.text, request, should_parse_tools)
+
+        if not _should_attempt_invalid_tool_repair(parsed):
+            return ChatExecutionResult(
+                output=output,
+                parsed=parsed,
+                total_prompt_tokens=total_prompt_tokens,
+                total_completion_tokens=total_completion_tokens,
+                repaired=repaired,
+            )
+
+        _log_invalid_tool_calls(endpoint, parsed.invalid_tool_calls, action="detected")
+        if attempt == 1:
+            _log_invalid_tool_calls(endpoint, parsed.invalid_tool_calls, action="exhausted")
+            return ChatExecutionResult(
+                output=output,
+                parsed=parsed,
+                total_prompt_tokens=total_prompt_tokens,
+                total_completion_tokens=total_completion_tokens,
+                repaired=repaired,
+            )
+
+        logger.info(
+            "Starting invalid-tool repair retry on %s endpoint with %d rejected tool call(s)",
+            endpoint,
+            len(parsed.invalid_tool_calls),
+        )
+        current_messages.extend(_build_invalid_tool_repair_messages(parsed))
+        repaired = True
+
+    return None
 
 
 def _set_tool_grammar_processor(chat_kwargs: dict, tools: list) -> None:
@@ -594,54 +858,78 @@ def _apply_tool_choice(
 def _validate_tool_calls(
     tool_calls: list | None,
     tools: list | None,
-) -> list | None:
-    """Remove tool calls with unknown names or invalid arguments.
+) -> ToolValidationResult:
+    """Validate parsed tool calls against the declared tools.
 
     Validates each parsed tool call against the declared tools:
     1. Function name must exist in the tools list.
     2. Arguments must be valid JSON.
     3. Arguments must conform to the tool's parameters schema (if declared).
 
-    Invalid tool calls are dropped with a warning log.
-    Returns None if all tool calls are invalid.
+    Returns both the accepted tool calls and the rejected attempts so the
+    caller can decide whether to surface, retry, or ignore them.
     """
     if not tool_calls:
-        return None
+        return ToolValidationResult(valid_tool_calls=None)
     if tools is None:
-        return tool_calls
+        return ToolValidationResult(valid_tool_calls=tool_calls)
 
-    # Build lookup: function name -> parameters schema
-    tools_by_name: dict[str, dict | None] = {}
-    for t in tools:
-        func = (
-            t.function
-            if isinstance(t, ToolDefinition)
-            else (t.get("function") if isinstance(t, dict) else None)
-        )
-        if func and isinstance(func, dict):
-            fname = func.get("name")
-            if fname:
-                tools_by_name[fname] = func.get("parameters")
+    tools_by_name = _declared_tools_by_name(tools)
+    available_tools = sorted(tools_by_name)
 
-    valid = []
-    for tc in tool_calls:
-        name = tc.function.name
+    valid_tool_calls = []
+    invalid_tool_calls = []
+    for tool_call in tool_calls:
+        name = tool_call.function.name
+        schema = tools_by_name.get(name)
         if name not in tools_by_name:
-            logger.warning("Dropping tool call with unknown function: %s", name)
+            invalid_tool_calls.append(
+                InvalidToolCall(
+                    tool_call=tool_call,
+                    error_type="unknown_tool",
+                    message=_format_invalid_tool_message(
+                        "unknown_tool", name, available_tools
+                    ),
+                    available_tools=available_tools,
+                )
+            )
             continue
-        schema = tools_by_name[name]
         if schema:
             try:
-                args = json.loads(tc.function.arguments)
+                args = json.loads(tool_call.function.arguments)
                 jsonschema.validate(args, schema)
-            except (json.JSONDecodeError, jsonschema.ValidationError, jsonschema.SchemaError) as exc:
-                logger.warning(
-                    "Dropping tool call %s: invalid arguments: %s", name, exc
+            except json.JSONDecodeError as exc:
+                invalid_tool_calls.append(
+                    InvalidToolCall(
+                        tool_call=tool_call,
+                        error_type="invalid_arguments_json",
+                        message=_format_invalid_tool_message(
+                            "invalid_arguments_json", name, available_tools
+                        ),
+                        available_tools=available_tools,
+                        validation_detail=str(exc),
+                    )
                 )
                 continue
-        valid.append(tc)
+            except (jsonschema.ValidationError, jsonschema.SchemaError) as exc:
+                invalid_tool_calls.append(
+                    InvalidToolCall(
+                        tool_call=tool_call,
+                        error_type="invalid_arguments_schema",
+                        message=_format_invalid_tool_message(
+                            "invalid_arguments_schema", name, available_tools
+                        ),
+                        available_tools=available_tools,
+                        validation_detail=str(exc),
+                    )
+                )
+                continue
+        valid_tool_calls.append(tool_call)
 
-    return valid or None
+    return ToolValidationResult(
+        valid_tool_calls=valid_tool_calls or None,
+        invalid_tool_calls=invalid_tool_calls,
+    )
 
 
 def _new_response_item_id(prefix: str) -> str:
@@ -1070,34 +1358,38 @@ async def _run_responses_request(
     )
 
     timeout = _default_timeout
-    output = await _wait_with_disconnect(
-        engine.chat(messages=messages, **chat_kwargs),
-        raw_request,
+    execution = await _run_chat_with_invalid_tool_repair(
+        engine=engine,
+        messages=messages,
+        request=chat_request,
+        raw_request=raw_request,
+        chat_kwargs=chat_kwargs,
+        should_parse_tools=should_parse_tools,
+        endpoint="responses",
         timeout=timeout,
     )
-    if output is None:
+    if execution is None:
         return None, []
 
-    cleaned_text, tool_calls = _parse_and_validate_tools(
-        output.text, chat_request, should_parse_tools
-    )
-    reasoning_text = None
-    if _reasoning_parser and not tool_calls:
-        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
-            cleaned_text or output.text
-        )
-
     output_items = _build_responses_output_items(
-        clean_output_text(cleaned_text) if cleaned_text else None,
-        reasoning_text,
-        tool_calls,
+        (
+            clean_output_text(execution.parsed.cleaned_text)
+            if execution.parsed.cleaned_text
+            else None
+        ),
+        execution.parsed.reasoning_text,
+        execution.parsed.valid_tool_calls,
     )
     response_object = _build_response_object(
         request=request,
         output_items=output_items,
-        prompt_tokens=output.prompt_tokens,
-        completion_tokens=output.completion_tokens,
-        finish_reason=output.finish_reason,
+        prompt_tokens=execution.total_prompt_tokens,
+        completion_tokens=execution.total_completion_tokens,
+        finish_reason=(
+            "tool_calls"
+            if execution.parsed.valid_tool_calls
+            else execution.output.finish_reason
+        ),
     )
 
     persisted_messages = _responses_request_to_persisted_messages(request)
@@ -2559,36 +2851,38 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     start_time = time.perf_counter()
     timeout = request.timeout or _default_timeout
 
-    output = await _wait_with_disconnect(
-        engine.chat(messages=messages, **chat_kwargs),
-        raw_request,
+    execution = await _run_chat_with_invalid_tool_repair(
+        engine=engine,
+        messages=messages,
+        request=request,
+        raw_request=raw_request,
+        chat_kwargs=chat_kwargs,
+        should_parse_tools=should_parse_tools,
+        endpoint="chat",
         timeout=timeout,
     )
-    if output is None:
+    if execution is None:
         return Response(status_code=499)  # Client closed request
 
     elapsed = time.perf_counter() - start_time
-    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+    tokens_per_sec = (
+        execution.total_completion_tokens / elapsed if elapsed > 0 else 0
+    )
     logger.info(
-        f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        "Chat completion: %s tokens in %.2fs (%.1f tok/s)%s",
+        execution.total_completion_tokens,
+        elapsed,
+        tokens_per_sec,
+        " after invalid-tool repair" if execution.repaired else "",
     )
 
-    # Parse tool calls from output using configured parser
-    cleaned_text, tool_calls = _parse_and_validate_tools(
-        output.text, request, should_parse_tools
-    )
-
-    # Extract reasoning content FIRST (strips channel tokens before JSON extraction)
-    reasoning_text = None
-    if _reasoning_parser and not tool_calls:
-        text_to_parse = cleaned_text or output.text
-        reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
-            text_to_parse
-        )
+    cleaned_text = execution.parsed.cleaned_text
+    tool_calls = execution.parsed.valid_tool_calls
+    reasoning_text = execution.parsed.reasoning_text
 
     # Process response_format if specified (after reasoning parser cleaned the text)
     if response_format and not tool_calls:
-        json_input = cleaned_text or output.text
+        json_input = cleaned_text or execution.output.text
         _, parsed_json, is_valid, error = parse_json_output(json_input, response_format)
         if parsed_json is not None:
             # Return JSON as string
@@ -2597,7 +2891,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             logger.warning(f"JSON validation failed: {error}")
 
     # Determine finish reason
-    finish_reason = "tool_calls" if tool_calls else output.finish_reason
+    finish_reason = "tool_calls" if tool_calls else execution.output.finish_reason
 
     return ChatCompletionResponse(
         model=_model_name,
@@ -2612,9 +2906,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             )
         ],
         usage=Usage(
-            prompt_tokens=output.prompt_tokens,
-            completion_tokens=output.completion_tokens,
-            total_tokens=output.prompt_tokens + output.completion_tokens,
+            prompt_tokens=execution.total_prompt_tokens,
+            completion_tokens=execution.total_completion_tokens,
+            total_tokens=(
+                execution.total_prompt_tokens + execution.total_completion_tokens
+            ),
         ),
     )
 
@@ -2797,32 +3093,39 @@ async def create_anthropic_message(
     start_time = time.perf_counter()
     timeout = _default_timeout
 
-    output = await _wait_with_disconnect(
-        engine.chat(messages=messages, **chat_kwargs),
-        request,
+    execution = await _run_chat_with_invalid_tool_repair(
+        engine=engine,
+        messages=messages,
+        request=openai_request,
+        raw_request=request,
+        chat_kwargs=chat_kwargs,
+        should_parse_tools=should_parse_tools,
+        endpoint="messages",
         timeout=timeout,
     )
-    if output is None:
+    if execution is None:
         return Response(status_code=499)  # Client closed request
 
     elapsed = time.perf_counter() - start_time
-    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(
-        f"Anthropic messages: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+    tokens_per_sec = (
+        execution.total_completion_tokens / elapsed if elapsed > 0 else 0
     )
-
-    # Parse tool calls
-    cleaned_text, tool_calls = _parse_and_validate_tools(
-        output.text, openai_request, should_parse_tools
+    logger.info(
+        "Anthropic messages: %s tokens in %.2fs (%.1f tok/s)%s",
+        execution.total_completion_tokens,
+        elapsed,
+        tokens_per_sec,
+        " after invalid-tool repair" if execution.repaired else "",
     )
 
     # Clean output text
     final_content = None
-    if cleaned_text:
-        final_content = clean_output_text(cleaned_text)
+    if execution.parsed.cleaned_text:
+        final_content = clean_output_text(execution.parsed.cleaned_text)
 
     # Determine finish reason
-    finish_reason = "tool_calls" if tool_calls else output.finish_reason
+    tool_calls = execution.parsed.valid_tool_calls
+    finish_reason = "tool_calls" if tool_calls else execution.output.finish_reason
 
     # Build OpenAI response to convert
     openai_response = ChatCompletionResponse(
@@ -2837,9 +3140,11 @@ async def create_anthropic_message(
             )
         ],
         usage=Usage(
-            prompt_tokens=output.prompt_tokens,
-            completion_tokens=output.completion_tokens,
-            total_tokens=output.prompt_tokens + output.completion_tokens,
+            prompt_tokens=execution.total_prompt_tokens,
+            completion_tokens=execution.total_completion_tokens,
+            total_tokens=(
+                execution.total_prompt_tokens + execution.total_completion_tokens
+            ),
         ),
     )
 

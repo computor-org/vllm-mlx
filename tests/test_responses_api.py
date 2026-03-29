@@ -409,6 +409,83 @@ class TestResponsesEndpoint:
         assert body["output"][0]["name"] == "shell"
         assert body["output_text"] == ""
 
+    def test_invalid_tool_call_is_repaired_before_response_items(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(
+            _output('<tool_call>{"name":"send_input","arguments":{"text":"oops"}}</tool_call>'),
+            _output('<tool_call>{"name":"shell","arguments":{"cmd":"pwd"}}</tool_call>'),
+        )
+        srv._engine = engine
+
+        resp = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "Use a tool",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "shell",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["output"][0]["type"] == "function_call"
+        assert body["output"][0]["name"] == "shell"
+        assert engine.chat.await_count == 2
+        retry_messages = engine.chat.await_args_list[1].kwargs["messages"]
+        assert retry_messages[-2]["role"] == "assistant"
+        assert retry_messages[-2]["tool_calls"][0]["function"]["name"] == "send_input"
+        assert retry_messages[-1]["role"] == "tool"
+        assert '"error_type": "unknown_tool"' in retry_messages[-1]["content"]
+
+    def test_repaired_response_history_persists_only_final_output(self, client):
+        import vllm_mlx.server as srv
+
+        engine = _mock_engine(
+            _output('<tool_call>{"name":"send_input","arguments":{"text":"oops"}}</tool_call>'),
+            _output("Recovered answer"),
+            _output("Follow-up answer"),
+        )
+        srv._engine = engine
+
+        first = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "input": "First prompt",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "shell",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+        )
+        first_id = first.json()["id"]
+
+        second = client.post(
+            "/v1/responses",
+            json={
+                "model": "test-model",
+                "previous_response_id": first_id,
+                "input": "Second prompt",
+            },
+        )
+
+        assert second.status_code == 200
+        follow_up_messages = engine.chat.await_args_list[2].kwargs["messages"]
+        assert all(msg["role"] != "tool" for msg in follow_up_messages)
+        assistant_messages = [msg for msg in follow_up_messages if msg["role"] == "assistant"]
+        assert len(assistant_messages) == 1
+        assert assistant_messages[0]["content"] == "Recovered answer"
+
     def test_streaming_response_returns_sse_events(self, client):
         import vllm_mlx.server as srv
 

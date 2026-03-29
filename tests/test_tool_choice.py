@@ -50,15 +50,18 @@ class FakeEngine:
     preserve_native_tool_format = False
 
     def __init__(self, text: str = TOOL_CALL_MARKUP):
-        self._text = text
+        self._outputs = text if isinstance(text, list) else [text]
         self.captured_messages = None
         self.captured_kwargs = None
+        self.chat_calls = []
 
     async def chat(self, messages, **kwargs):
         self.captured_messages = messages
         self.captured_kwargs = kwargs
+        self.chat_calls.append((messages, kwargs))
+        text = self._outputs[min(len(self.chat_calls) - 1, len(self._outputs) - 1)]
         return GenerationOutput(
-            text=self._text,
+            text=text,
             prompt_tokens=10,
             completion_tokens=5,
             finish_reason="stop",
@@ -412,16 +415,19 @@ class TestToolCallValidation:
         }
         tools = [self._make_tool_def("get_weather", schema)]
         result = srv._validate_tool_calls([tc], tools)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0].function.name == "get_weather"
+        assert result.valid_tool_calls is not None
+        assert len(result.valid_tool_calls) == 1
+        assert result.valid_tool_calls[0].function.name == "get_weather"
+        assert result.invalid_tool_calls == []
 
     def test_unknown_function_name_dropped(self):
         """Unknown function name removed."""
         tc = self._make_tool_call("nonexistent", '{"x": 1}')
         tools = [self._make_tool_def("get_weather")]
         result = srv._validate_tool_calls([tc], tools)
-        assert result is None
+        assert result.valid_tool_calls is None
+        assert len(result.invalid_tool_calls) == 1
+        assert result.invalid_tool_calls[0].error_type == "unknown_tool"
 
     def test_invalid_json_arguments_dropped(self):
         """Malformed JSON arguments removed."""
@@ -432,7 +438,8 @@ class TestToolCallValidation:
         }
         tools = [self._make_tool_def("get_weather", schema)]
         result = srv._validate_tool_calls([tc], tools)
-        assert result is None
+        assert result.valid_tool_calls is None
+        assert result.invalid_tool_calls[0].error_type == "invalid_arguments_json"
 
     def test_schema_violation_dropped(self):
         """Valid JSON but wrong types removed."""
@@ -444,14 +451,15 @@ class TestToolCallValidation:
         }
         tools = [self._make_tool_def("get_weather", schema)]
         result = srv._validate_tool_calls([tc], tools)
-        assert result is None
+        assert result.valid_tool_calls is None
+        assert result.invalid_tool_calls[0].error_type == "invalid_arguments_schema"
 
     def test_no_tools_skips_validation(self):
         """If tools is None, all tool calls pass through."""
         tc = self._make_tool_call("anything", "{}")
         result = srv._validate_tool_calls([tc], None)
-        assert result is not None
-        assert len(result) == 1
+        assert result.valid_tool_calls is not None
+        assert len(result.valid_tool_calls) == 1
 
     def test_all_invalid_returns_none(self):
         """All tool calls invalid returns None."""
@@ -459,7 +467,8 @@ class TestToolCallValidation:
         tc2 = self._make_tool_call("bad2", "{}")
         tools = [self._make_tool_def("good_func")]
         result = srv._validate_tool_calls([tc1, tc2], tools)
-        assert result is None
+        assert result.valid_tool_calls is None
+        assert len(result.invalid_tool_calls) == 2
 
     def test_mixed_valid_and_invalid(self):
         """Mix of valid and invalid keeps only valid."""
@@ -471,35 +480,39 @@ class TestToolCallValidation:
         }
         tools = [self._make_tool_def("get_weather", schema)]
         result = srv._validate_tool_calls([tc_good, tc_bad], tools)
-        assert result is not None
-        assert len(result) == 1
-        assert result[0].function.name == "get_weather"
+        assert result.valid_tool_calls is not None
+        assert len(result.valid_tool_calls) == 1
+        assert result.valid_tool_calls[0].function.name == "get_weather"
+        assert len(result.invalid_tool_calls) == 1
 
     def test_no_schema_skips_argument_validation(self):
         """Tool without parameters schema does name check only."""
         tc = self._make_tool_call("simple_tool", '{"any": "thing"}')
         tools = [self._make_tool_def("simple_tool")]
         result = srv._validate_tool_calls([tc], tools)
-        assert result is not None
-        assert len(result) == 1
+        assert result.valid_tool_calls is not None
+        assert len(result.valid_tool_calls) == 1
 
     def test_empty_tool_calls_returns_none(self):
         """Empty tool_calls list returns None."""
         tools = [self._make_tool_def("get_weather")]
         result = srv._validate_tool_calls([], tools)
-        assert result is None
+        assert result.valid_tool_calls is None
+        assert result.invalid_tool_calls == []
 
     def test_none_tool_calls_returns_none(self):
         """None tool_calls passes through as None."""
         tools = [self._make_tool_def("get_weather")]
         result = srv._validate_tool_calls(None, tools)
-        assert result is None
+        assert result.valid_tool_calls is None
+        assert result.invalid_tool_calls == []
 
     def test_empty_tools_list_drops_all(self):
         """Empty tools list means no declared tools; all calls dropped."""
         tc = self._make_tool_call("get_weather", '{"city": "NYC"}')
         result = srv._validate_tool_calls([tc], [])
-        assert result is None
+        assert result.valid_tool_calls is None
+        assert len(result.invalid_tool_calls) == 1
 
     def test_dict_tool_definition_supported(self):
         """Raw dict tool definitions (not ToolDefinition objects) also work."""
@@ -517,8 +530,8 @@ class TestToolCallValidation:
             }
         ]
         result = srv._validate_tool_calls([tc], tools)
-        assert result is not None
-        assert len(result) == 1
+        assert result.valid_tool_calls is not None
+        assert len(result.valid_tool_calls) == 1
 
     def test_malformed_tool_definition_skipped(self):
         """Tool def dict missing 'name' key doesn't crash."""
@@ -528,8 +541,8 @@ class TestToolCallValidation:
             self._make_tool_def("get_weather"),
         ]
         result = srv._validate_tool_calls([tc], tools)
-        assert result is not None
-        assert len(result) == 1
+        assert result.valid_tool_calls is not None
+        assert len(result.valid_tool_calls) == 1
 
     def test_malformed_schema_drops_tool_call(self):
         """Tool with invalid JSON Schema drops the call instead of crashing."""
@@ -537,7 +550,8 @@ class TestToolCallValidation:
         bad_schema = {"type": "object", "properties": {"x": {"type": "nonexistent_type"}}}
         tools = [self._make_tool_def("bad_schema", bad_schema)]
         result = srv._validate_tool_calls([tc], tools)
-        assert result is None
+        assert result.valid_tool_calls is None
+        assert result.invalid_tool_calls[0].error_type == "invalid_arguments_schema"
 
 
 # ---------------------------------------------------------------------------
@@ -551,11 +565,11 @@ HALLUCINATED_TOOL_CALL_MARKUP = (
 
 
 class TestToolCallValidationEndpoint:
-    """Integration test: invalid tool calls removed from API response."""
+    """Integration test: invalid tool calls are repaired instead of silently dropped."""
 
-    def test_hallucinated_tool_call_removed(self):
-        """Engine returns tool call for undeclared function; response has no tool_calls."""
-        engine = FakeEngine(text=HALLUCINATED_TOOL_CALL_MARKUP)
+    def test_hallucinated_tool_call_repaired(self):
+        """Undeclared tool call triggers one synthetic error turn and a retry."""
+        engine = FakeEngine(text=[HALLUCINATED_TOOL_CALL_MARKUP, TOOL_CALL_MARKUP])
         orig_engine, orig_model = _patch_engine(engine)
         client = TestClient(srv.app)
         try:
@@ -574,7 +588,15 @@ class TestToolCallValidationEndpoint:
         assert response.status_code == 200
         data = response.json()
         msg = data["choices"][0]["message"]
-        assert msg.get("tool_calls") is None
+        assert msg.get("tool_calls") is not None
+        assert msg["tool_calls"][0]["function"]["name"] == "get_weather"
+        assert len(engine.chat_calls) == 2
+        retry_messages = engine.chat_calls[1][0]
+        assert retry_messages[-2]["role"] == "assistant"
+        assert retry_messages[-2]["tool_calls"][0]["function"]["name"] == "nonexistent_func"
+        assert retry_messages[-1]["role"] == "tool"
+        assert '"error": "invalid_tool_call"' in retry_messages[-1]["content"]
+        assert '"error_type": "unknown_tool"' in retry_messages[-1]["content"]
 
     def test_valid_tool_call_kept(self):
         """Engine returns tool call for declared function; response has tool_calls."""
@@ -599,3 +621,43 @@ class TestToolCallValidationEndpoint:
         msg = data["choices"][0]["message"]
         assert msg.get("tool_calls") is not None
         assert msg["tool_calls"][0]["function"]["name"] == "get_weather"
+
+    def test_anthropic_invalid_tool_call_repaired(self):
+        """Anthropic endpoint shares the same invalid-tool repair loop."""
+        engine = FakeEngine(
+            text=[
+                HALLUCINATED_TOOL_CALL_MARKUP,
+                '<tool_call>\n{"name": "get_time", "arguments": {"timezone": "UTC"}}\n</tool_call>',
+            ]
+        )
+        orig_engine, orig_model = _patch_engine(engine)
+        client = TestClient(srv.app)
+        try:
+            response = client.post(
+                "/v1/messages",
+                json={
+                    "model": "test-model",
+                    "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "what time is it?"}],
+                    "tools": [
+                        {
+                            "name": "get_time",
+                            "description": "Get current time in a timezone",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"timezone": {"type": "string"}},
+                                "required": ["timezone"],
+                            },
+                        }
+                    ],
+                },
+            )
+        finally:
+            _restore_engine(orig_engine, orig_model)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["stop_reason"] == "tool_use"
+        assert body["content"][0]["type"] == "tool_use"
+        assert body["content"][0]["name"] == "get_time"
+        assert len(engine.chat_calls) == 2

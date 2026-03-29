@@ -23,6 +23,13 @@ from .abstract_tool_parser import (
 )
 
 ALPHANUMERIC = ascii_letters + digits
+_TOKEN_SPACE_MARKERS = str.maketrans(
+    {
+        "Ġ": " ",
+        "Ċ": "\n",
+        "ĉ": "\t",
+    }
+)
 
 
 def generate_mistral_tool_id() -> str:
@@ -51,6 +58,19 @@ class MistralToolParser(ToolParser):
 
     BOT_TOKEN = "[TOOL_CALLS]"
     TOOL_CALL_REGEX = re.compile(r"\[{.*}\]", re.DOTALL)
+
+    @staticmethod
+    def _normalize_tool_name(tool_name: str) -> str:
+        """Strip Mistral-specific suffix markers from a tool name."""
+        tool_name = tool_name.strip()
+        if tool_name.endswith("[ARGS]"):
+            tool_name = tool_name[: -len("[ARGS]")]
+        return tool_name.strip()
+
+    @staticmethod
+    def _normalize_arguments_text(arguments: str) -> str:
+        """Remove tokenizer-visible whitespace markers from JSON arguments."""
+        return arguments.translate(_TOKEN_SPACE_MARKERS).strip()
 
     def __init__(self, tokenizer=None):
         super().__init__(tokenizer)
@@ -89,8 +109,8 @@ class MistralToolParser(ToolParser):
             # Try new format first: func_name{"arg": "value"}
             if not raw_tool_call.startswith("[") and "{" in raw_tool_call:
                 end_name = raw_tool_call.find("{")
-                tool_name = raw_tool_call[:end_name].strip()
-                args_str = raw_tool_call[end_name:]
+                tool_name = self._normalize_tool_name(raw_tool_call[:end_name])
+                args_str = self._normalize_arguments_text(raw_tool_call[end_name:])
 
                 if tool_name:
                     tool_calls.append(
@@ -241,17 +261,18 @@ class MistralToolParser(ToolParser):
 
         # Check for function name (before {)
         if "{" in text:
-            name_part = text[: text.find("{")]
-            args_part = text[text.find("{") :]
-            if name_part.strip():
-                result["name"] = name_part.strip()
+            name_part = self._normalize_tool_name(text[: text.find("{")])
+            args_part = self._normalize_arguments_text(text[text.find("{") :])
+            if name_part:
+                result["name"] = name_part
             if args_part:
                 result["arguments"] = args_part
         else:
             # Could be name or arguments continuation
-            if text.strip() and not text.startswith(("{", "}", "[", "]", ",")):
-                result["name"] = text.strip()
+            name_part = self._normalize_tool_name(text)
+            if name_part and not text.startswith(("{", "}", "[", "]", ",")):
+                result["name"] = name_part
             else:
-                result["arguments"] = text
+                result["arguments"] = self._normalize_arguments_text(text)
 
         return result if result else None
