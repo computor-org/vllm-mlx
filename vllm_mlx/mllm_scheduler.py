@@ -349,6 +349,8 @@ class MLLMScheduler:
         request.status = RequestStatus.FINISHED_ABORTED
         self.finished_req_ids.add(request_id)
 
+        self._detokenizer_pool.pop(request_id, None)
+
         # Signal output queue
         if request_id in self.output_queues:
             try:
@@ -797,6 +799,7 @@ class MLLMScheduler:
         self.finished_req_ids.clear()
         self.request_id_to_uid.clear()
         self.uid_to_request_id.clear()
+        self._detokenizer_pool.clear()
 
         if self.batch_generator is not None:
             self.batch_generator.close()
