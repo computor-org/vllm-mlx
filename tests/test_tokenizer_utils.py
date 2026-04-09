@@ -33,13 +33,16 @@ class TestLoadModelWithFallback:
         fake_model = object()
         fake_tokenizer = object()
 
-        with patch(
-            "mlx_lm.load",
-            side_effect=ValueError("Tokenizer class Foo does not exist"),
-        ), patch(
-            "vllm_mlx.utils.tokenizer._load_with_tokenizer_fallback",
-            return_value=(fake_model, fake_tokenizer),
-        ) as fallback:
+        with (
+            patch(
+                "mlx_lm.load",
+                side_effect=ValueError("Tokenizer class Foo does not exist"),
+            ),
+            patch(
+                "vllm_mlx.utils.tokenizer._load_with_tokenizer_fallback",
+                return_value=(fake_model, fake_tokenizer),
+            ) as fallback,
+        ):
             model, tokenizer = load_model_with_fallback("example/model")
 
         fallback.assert_called_once_with("example/model")
