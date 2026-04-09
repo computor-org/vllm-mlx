@@ -134,7 +134,7 @@ class TestSimpleEngineConcurrency:
                 finished=False,
             )
             yield MagicMock(
-                text="<|im_end|><tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}</tool_call>",
+                text='<|im_end|><tool_call>{"name":"bash","arguments":{"command":"pwd"}}</tool_call>',
                 tokens=[],
                 prompt_tokens=11,
                 completion_tokens=4,
