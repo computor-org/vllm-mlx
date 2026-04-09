@@ -309,7 +309,10 @@ class TestSchedulerBasic:
         callback_payloads = []
 
         from collections import namedtuple
-        _Response = namedtuple("Response", ["uid", "token", "logprobs", "finish_reason", "cache"])
+
+        _Response = namedtuple(
+            "Response", ["uid", "token", "logprobs", "finish_reason", "cache"]
+        )
 
         class FakeBatchGenerator:
             Response = _Response

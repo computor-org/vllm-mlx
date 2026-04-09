@@ -313,7 +313,11 @@ def _install_chunked_prefill(
                 if self.prompt_checkpoint_callback is not None:
                     self.prompt_checkpoint_callback(
                         [
-                            (uid, prompt_checkpoint, _lazy_extract_cache(prompt_cache, i))
+                            (
+                                uid,
+                                prompt_checkpoint,
+                                _lazy_extract_cache(prompt_cache, i),
+                            )
                             for i, uid in enumerate(partial["uids"])
                         ]
                     )
@@ -449,9 +453,7 @@ def _install_chunked_prefill(
                         prompt_cache = _merge_caches(caches)
                         for c in prompt_cache:
                             c.prepare(
-                                lengths=[
-                                    ln - prompt_checkpoint for ln in lengths
-                                ],
+                                lengths=[ln - prompt_checkpoint for ln in lengths],
                                 right_padding=padding,
                             )
 
@@ -476,7 +478,9 @@ def _install_chunked_prefill(
                         _adjusted_pb = _pb - _cached
                         if 0 < _adjusted_pb < padded.shape[1] - prompt_checkpoint + 1:
                             _first_chunk = _adjusted_pb
-                    n_to_process = min(_first_chunk, padded.shape[1] - prompt_checkpoint)
+                    n_to_process = min(
+                        _first_chunk, padded.shape[1] - prompt_checkpoint
+                    )
                     if n_to_process > 0:
                         self.model(
                             mx.contiguous(padded[:, :n_to_process]),
