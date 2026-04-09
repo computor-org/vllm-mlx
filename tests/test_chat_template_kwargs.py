@@ -152,9 +152,11 @@ async def test_simple_engine_stream_generate_text_applies_chat_template_kwargs()
         engine._text_model = MagicMock()
         engine._text_model.model = MagicMock()
 
-        with patch("mlx_lm.stream_generate", return_value=iter(())), patch(
-            "mlx_lm.models.cache.make_prompt_cache", return_value=[]
-        ), patch("mlx_lm.sample_utils.make_sampler", return_value=object()):
+        with (
+            patch("mlx_lm.stream_generate", return_value=iter(())),
+            patch("mlx_lm.models.cache.make_prompt_cache", return_value=[]),
+            patch("mlx_lm.sample_utils.make_sampler", return_value=object()),
+        ):
             chunks = [
                 chunk
                 async for chunk in engine._stream_generate_text(
