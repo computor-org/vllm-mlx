@@ -1341,7 +1341,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     total_prompt_tokens = 0
 
     for i, prompt in enumerate(prompts):
-        gen_kwargs = {
+        generate_kwargs = {
+            "prompt": prompt,
             "max_tokens": request.max_tokens or _default_max_tokens,
             "temperature": _resolve_temperature(request.temperature),
             "top_p": _resolve_top_p(request.top_p),
@@ -1351,9 +1352,14 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
             "stop": request.stop,
         }
         if comp_rep_penalty is not None:
-            gen_kwargs["repetition_penalty"] = comp_rep_penalty
+            generate_kwargs["repetition_penalty"] = comp_rep_penalty
+        if request.specprefill is not None:
+            generate_kwargs["specprefill"] = request.specprefill
+        if request.specprefill_keep_pct is not None:
+            generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+
         output = await _wait_with_disconnect(
-            engine.generate(prompt=prompt, **gen_kwargs),
+            engine.generate(**generate_kwargs),
             raw_request,
             timeout=timeout,
         )
@@ -2285,7 +2291,8 @@ async def stream_completion(
     repetition_penalty: float | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
-    gen_kwargs = {
+    generate_kwargs = {
+        "prompt": prompt,
         "max_tokens": request.max_tokens or _default_max_tokens,
         "temperature": _resolve_temperature(request.temperature),
         "top_p": _resolve_top_p(request.top_p),
@@ -2295,8 +2302,13 @@ async def stream_completion(
         "stop": request.stop,
     }
     if repetition_penalty is not None:
-        gen_kwargs["repetition_penalty"] = repetition_penalty
-    async for output in engine.stream_generate(prompt=prompt, **gen_kwargs):
+        generate_kwargs["repetition_penalty"] = repetition_penalty
+    if request.specprefill is not None:
+        generate_kwargs["specprefill"] = request.specprefill
+    if request.specprefill_keep_pct is not None:
+        generate_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+
+    async for output in engine.stream_generate(**generate_kwargs):
         data = {
             "id": f"cmpl-{uuid.uuid4().hex[:8]}",
             "object": "text_completion",
