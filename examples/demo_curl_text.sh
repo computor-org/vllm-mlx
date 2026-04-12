@@ -4,10 +4,7 @@
 # Shows how to use vllm-mlx with curl for text-only chat.
 #
 # Usage:
-#   1. Start the server:
-#      # Without a custom API model name (model path is the name used in the OpenAI API):
-#      vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
-#      # With a custom API model name ("my-model" is the name used in the OpenAI API):
+#   1. Start the server with a model name "my-model":
 #      vllm-mlx serve --served-model-name my-model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
 #
 #   2. Run this script:
@@ -34,7 +31,7 @@ echo ""
 curl -s "$SERVER_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "default",
+    "model": "my-model",
     "messages": [
       {"role": "user", "content": "Hello, who are you?"}
     ],
@@ -53,7 +50,7 @@ echo ""
 curl -s "$SERVER_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "default",
+    "model": "my-model",
     "messages": [
       {"role": "system", "content": "You are a pirate. Respond in pirate speak."},
       {"role": "user", "content": "What is the weather like today?"}
@@ -72,7 +69,7 @@ echo "Response: "
 curl -s "$SERVER_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "default",
+    "model": "my-model",
     "messages": [
       {"role": "user", "content": "Count from 1 to 5, one number per line"}
     ],
@@ -97,7 +94,7 @@ echo "User: What is 2 + 2?"
 curl -s "$SERVER_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "default",
+    "model": "my-model",
     "messages": [
       {"role": "user", "content": "What is 2 + 2?"}
     ],
@@ -109,7 +106,7 @@ echo "User: Now multiply that by 10"
 curl -s "$SERVER_URL/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "default",
+    "model": "my-model",
     "messages": [
       {"role": "user", "content": "What is 2 + 2?"},
       {"role": "assistant", "content": "4"},
@@ -128,7 +125,7 @@ echo "Prompt: The capital of France is"
 curl -s "$SERVER_URL/v1/completions" \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "default",
+    "model": "my-model",
     "prompt": "The capital of France is",
     "max_tokens": 20
   }' | python3 -c "import sys,json; r=json.load(sys.stdin); print('Response:', r['choices'][0]['text'])"

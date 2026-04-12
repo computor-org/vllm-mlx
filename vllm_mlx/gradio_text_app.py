@@ -9,14 +9,20 @@ Usage:
     # First start the server with a model:
     # Without a custom API model name (model path is the name used in the OpenAI API):
     vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
-    # With a custom API model name ("my-model" is the name used in the OpenAI API):
-    vllm-mlx serve --served-model-name my-model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+    # With a custom API model name ("default" is the name used in the OpenAI API):
+    vllm-mlx serve --served-model-name default mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
 
     # Then run this app:
-    vllm-mlx-text-chat
+    vllm-mlx-text-chat --served-model-name mlx-community/Llama-3.2-3B-Instruct-4bit
 
-    # Or with custom settings:
+    # Or with vllm-mlx started with served model name is 'default', there is no need to use --served-model-name:
     vllm-mlx-text-chat --server-url http://localhost:8000 --port 7861
+
+Note:
+    Query the /v1/models endpoint with `curl` and `jq` to see available models and their names:
+    ```bash
+    curl http://localhost:8000/v1/models | jq ".data[0].id"
+    ```
 """
 
 import argparse
@@ -110,7 +116,12 @@ def main():
         epilog="""
 Examples:
     # Start with default settings
-    vllm-mlx-text-chat
+    vllm-mlx-text-chat --served-model-name <served-model name>
+
+    # name OpenAI returns from /v1/models can be set with --served-model-name, for example:
+    vllm-mlx-text-chat --served-model-name <served-model name>
+    # example starting chat on the first model served on localhost:8000:
+    vllm-mlx-text-chat --served-model-name $(curl http://localhost:8000/v1/models | jq ".data[0].id)
 
     # Connect to a different server
     vllm-mlx-text-chat --server-url http://localhost:9000
@@ -119,10 +130,7 @@ Examples:
     vllm-mlx-text-chat --share
 
 Note: Make sure the vllm-mlx server is running:
-    # Without a custom API model name (model path is the name used in the OpenAI API):
-    vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
-    # With a custom API model name ("my-model" is the name used in the OpenAI API):
-    vllm-mlx serve --served-model-name my-model mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
+    vllm-mlx serve --served-model-name default mlx-community/Llama-3.2-3B-Instruct-4bit --port 8000
         """,
     )
     parser.add_argument(

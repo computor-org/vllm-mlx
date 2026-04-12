@@ -5,11 +5,8 @@ Demo: OpenAI API - Image Analysis
 Shows how to use vllm-mlx with the OpenAI Python SDK for image understanding.
 
 Usage:
-    1. Start the server with a VLM model:
-       # Without a custom API model name (model path is the name used in the OpenAI API):
-       vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
-       # With a custom API model name ("my-model" is the name used in the OpenAI API):
-       vllm-mlx serve --served-model-name my-model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+    1. Start the server with a VLM model ("vision-model" is the name used in the OpenAI API):
+       vllm-mlx serve --served-model-name vision-model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 
     2. Run this script:
        python examples/demo_openai_image.py
@@ -36,7 +33,7 @@ print(f"Image URL: {image_url}")
 print("Question: What animal is in this image?")
 
 response = client.chat.completions.create(
-    model="default",
+    model="vision-model",
     messages=[{
         "role": "user",
         "content": [
@@ -56,7 +53,7 @@ print(f"Image URL: {scene_url}")
 print("Question: What famous building is this?")
 
 response = client.chat.completions.create(
-    model="default",
+    model="vision-model",
     messages=[{
         "role": "user",
         "content": [
@@ -87,7 +84,7 @@ try:
     print("Question: What color is this image?")
 
     response = client.chat.completions.create(
-        model="default",
+        model="vision-model",
         messages=[{
             "role": "user",
             "content": [
@@ -116,7 +113,7 @@ messages = [{
 }]
 
 response = client.chat.completions.create(
-    model="default",
+    model="vision-model",
     messages=messages,
     max_tokens=150
 )
@@ -128,7 +125,7 @@ messages.append({"role": "assistant", "content": response.choices[0].message.con
 messages.append({"role": "user", "content": "Which of these foods are fruits?"})
 
 response = client.chat.completions.create(
-    model="default",
+    model="vision-model",
     messages=messages,
     max_tokens=100
 )

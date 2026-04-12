@@ -7,10 +7,7 @@ It tests both the direct HTTP API and the official OpenAI Python client.
 
 Usage:
     # First start the server:
-    # Without a custom API model name (model path is the name used in the OpenAI API):
-    vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
-    # With a custom API model name ("my-model" is the name used in the OpenAI API):
-    vllm-mlx serve --served-model-name my-model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
+    vllm-mlx serve --served-model-name default mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000
 
     # Then run this script:
     python examples/test_openai_compatibility.py
@@ -725,11 +722,8 @@ Examples:
     print(f"Checking server at {args.server_url}...")
     if not test_health_endpoint(args.server_url):
         print(f"{RED}ERROR: Cannot connect to server at {args.server_url}{RESET}")
-        print("Make sure the vllm-mlx server is running:")
-        print("  # Without a custom API model name (model path is the name used in the OpenAI API):")
-        print("  vllm-mlx serve mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000")
-        print("  # With a custom API model name ('my-model' is the name used in the OpenAI API):")
-        print("  vllm-mlx serve --served-model-name my-model mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000")
+        print("Make sure the vllm-mlx server is running. Tests assume model name is served as 'default':")
+        print("  vllm-mlx serve --served-model-name default mlx-community/Qwen3-VL-4B-Instruct-3bit --port 8000")
         sys.exit(1)
 
     print(f"{GREEN}Server is reachable!{RESET}")
