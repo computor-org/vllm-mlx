@@ -13,7 +13,7 @@ import time
 import uuid
 from typing import Any
 
-from pydantic import BaseModel, Field, computed_field
+from pydantic import AliasChoices, BaseModel, Field
 
 # =============================================================================
 # Content Types (for multimodal messages)
@@ -159,6 +159,10 @@ class ChatCompletionRequest(BaseModel):
     messages: list[Message]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     max_tokens: int | None = None
     stream: bool = False
     stream_options: StreamOptions | None = (
@@ -175,12 +179,16 @@ class ChatCompletionRequest(BaseModel):
     # MLLM-specific parameters
     video_fps: float | None = None
     video_max_frames: int | None = None
+    # Sampling penalties
+    repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
     # SpecPrefill: per-request enable/disable (None = server decides)
     specprefill: bool | None = None
     # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
     specprefill_keep_pct: float | None = None
+    # Enable/disable thinking mode (None = server default, typically True)
+    enable_thinking: bool | None = None
 
 
 class AssistantMessage(BaseModel):
@@ -188,16 +196,15 @@ class AssistantMessage(BaseModel):
 
     role: str = "assistant"
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
     )
     tool_calls: list[ToolCall] | None = None
 
-    @computed_field
     @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
-        return self.reasoning
+    def reasoning(self) -> str | None:
+        return self.reasoning_content
 
 
 class ChatCompletionChoice(BaseModel):
@@ -239,11 +246,21 @@ class CompletionRequest(BaseModel):
     prompt: str | list[str]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
+    presence_penalty: float | None = None
+    repetition_penalty: float | None = None
     max_tokens: int | None = None
     stream: bool = False
     stop: list[str] | None = None
+    # Sampling penalties
+    repetition_penalty: float | None = None  # mlx-lm style (>1.0 penalizes)
     # Request timeout in seconds (None = use server default)
     timeout: float | None = None
+    # SpecPrefill: per-request enable/disable (None = server decides)
+    specprefill: bool | None = None
+    # SpecPrefill: per-request keep percentage (0.0-1.0, None = use server default)
+    specprefill_keep_pct: float | None = None
 
 
 class CompletionChoice(BaseModel):
@@ -427,16 +444,15 @@ class ChatCompletionChunkDelta(BaseModel):
 
     role: str | None = None
     content: str | None = None
-    reasoning: str | None = (
-        None  # Reasoning/thinking content (when --reasoning-parser is used)
+    reasoning_content: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("reasoning_content", "reasoning"),
     )
     tool_calls: list[dict] | None = None
 
-    @computed_field
     @property
-    def reasoning_content(self) -> str | None:
-        """Alias for reasoning field. Serialized for backwards compatibility with clients expecting reasoning_content."""
-        return self.reasoning
+    def reasoning(self) -> str | None:
+        return self.reasoning_content
 
 
 class ChatCompletionChunkChoice(BaseModel):

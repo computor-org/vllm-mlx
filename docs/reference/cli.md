@@ -22,11 +22,13 @@ vllm-mlx serve <model> [options]
 
 | Option | Description | Default |
 |--------|-------------|---------|
+| `--served-model-name` | Custom model name exposed through the OpenAI API. If not set, the model path is used as the name. | None |
 | `--port` | Server port | 8000 |
 | `--host` | Server host | 0.0.0.0 |
 | `--api-key` | API key for authentication | None |
 | `--rate-limit` | Requests per minute per client (0 = disabled) | 0 |
 | `--timeout` | Request timeout in seconds | 300 |
+| `--enable-metrics` | Expose Prometheus metrics on `/metrics` | False |
 | `--continuous-batching` | Enable batching for multi-user | False |
 | `--cache-memory-mb` | Cache memory limit in MB | Auto |
 | `--cache-memory-percent` | Fraction of RAM for cache | 0.20 |
@@ -49,7 +51,15 @@ vllm-mlx serve <model> [options]
 
 ```bash
 # Simple mode (single user, max throughput)
+# Model path is used as the model name in the OpenAI API (e.g. model="mlx-community/Llama-3.2-3B-Instruct-4bit")
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit
+
+Model will show up as 'mlx-community/Llama-3.2-3B-Instruct-4bit' in the `/v1/models` API endpoint. View with `curl http://localhost:8000/v1/models` or similar.
+
+# With a custom API model name (model is accessed as "my-model" via the OpenAI API)
+# --served-model-name sets the name clients must use when calling the API (e.g. model="my-model")
+vllm-mlx serve --served-model-name my-model mlx-community/Llama-3.2-3B-Instruct-4bit
+# Note: Model will show up as 'my-model' in the `/v1/models` API endpoint.
 
 # Continuous batching (multiple users)
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --continuous-batching
@@ -87,6 +97,9 @@ vllm-mlx serve mlx-community/granite-4.0-tiny-preview-4bit \
 
 # With API key authentication
 vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --api-key your-secret-key
+
+# Expose Prometheus metrics
+vllm-mlx serve mlx-community/Llama-3.2-3B-Instruct-4bit --enable-metrics
 
 # Production setup with security options
 vllm-mlx serve mlx-community/Qwen3-4B-4bit \
@@ -165,7 +178,7 @@ Start Gradio chat interface.
 ### Usage
 
 ```bash
-vllm-mlx-chat --model <model> [options]
+vllm-mlx-chat --served-model-name <model-name> [options]
 ```
 
 ### Options
@@ -180,10 +193,10 @@ vllm-mlx-chat --model <model> [options]
 
 ```bash
 # Multimodal chat (text + images + video)
-vllm-mlx-chat --model mlx-community/Qwen3-VL-4B-Instruct-3bit
+vllm-mlx-chat --served-model-name mlx-community/Qwen3-VL-4B-Instruct-3bit
 
 # Text-only chat
-vllm-mlx-chat --model mlx-community/Llama-3.2-3B-Instruct-4bit --text-only
+vllm-mlx-chat --served-model-name mlx-community/Llama-3.2-3B-Instruct-4bit --text-only
 ```
 
 ## Environment Variables

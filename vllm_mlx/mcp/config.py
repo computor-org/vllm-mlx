@@ -13,10 +13,8 @@ from .types import MCPConfig, MCPServerConfig
 
 logger = logging.getLogger(__name__)
 
-# Default config search paths
+# Default per-user config search paths
 CONFIG_SEARCH_PATHS = [
-    "./mcp.json",
-    "./mcp.yaml",
     "~/.config/vllm-mlx/mcp.json",
     "~/.config/vllm-mlx/mcp.yaml",
 ]
@@ -32,8 +30,7 @@ def load_mcp_config(path: Optional[Union[str, Path]] = None) -> MCPConfig:
     Search order:
     1. Explicit path argument
     2. VLLM_MLX_MCP_CONFIG environment variable
-    3. ./mcp.json or ./mcp.yaml (current directory)
-    4. ~/.config/vllm-mlx/mcp.json or mcp.yaml
+    3. ~/.config/vllm-mlx/mcp.json or mcp.yaml
 
     Args:
         path: Optional explicit path to config file
@@ -128,6 +125,11 @@ def validate_config(data: Dict[str, Any]) -> MCPConfig:
             # Ensure name is set
             if isinstance(server_data, dict):
                 server_data = server_data.copy()
+                if "skip_security_validation" in server_data:
+                    raise ValueError(
+                        f"Server '{name}' uses removed field 'skip_security_validation'. "
+                        "Use environment variable VLLM_MCP_ALLOW_UNSAFE=1 for explicit local development bypasses."
+                    )
                 server_data["name"] = name
                 servers[name] = MCPServerConfig(**server_data)
             else:

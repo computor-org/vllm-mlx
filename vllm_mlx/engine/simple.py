@@ -8,6 +8,7 @@ performance when serving a single user at a time.
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -78,6 +79,7 @@ class SimpleEngine(BaseEngine):
             specprefill_draft_model: Path to small draft model for importance scoring
         """
         self._model_name = model_name
+        self._created_at = time.time()
         self._trust_remote_code = trust_remote_code
         self._enable_cache = enable_cache
         self._is_mllm = force_mllm or is_mllm_model(model_name)
@@ -256,13 +258,27 @@ class SimpleEngine(BaseEngine):
         """
         Generate a complete response (non-streaming).
 
+        Thin accumulator over stream_generate(). stream_generate() is the
+        only code path that consumes per-request SpecPrefill overrides
+        (`specprefill`, `specprefill_keep_pct`) and routes through
+        _stream_generate_specprefill() when engaged. The prior direct
+        self._model.generate() path silently dropped those overrides for
+        non-streaming /v1/completions callers, so extra_body.specprefill
+        was advertised by the server but had no effect on this route.
+
+        By iterating stream_generate() and returning the last
+        GenerationOutput, non-streaming clients get the same SpecPrefill
+        engagement, accurate prompt_tokens reporting, and per-request
+        override support as streaming clients.
+
         Args:
             prompt: Input text
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Top-p sampling
             stop: Stop sequences
-            **kwargs: Additional model-specific parameters
+            **kwargs: Additional parameters forwarded to stream_generate,
+                including per-request `specprefill` / `specprefill_keep_pct`
 
         Returns:
             GenerationOutput with complete text
@@ -270,27 +286,28 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        output = await self._run_blocking_serialized(
-            self._model.generate,
+        last_output: GenerationOutput | None = None
+        async for output in self.stream_generate(
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
             stop=stop,
             **kwargs,
-        )
+        ):
+            last_output = output
 
-        # Clean output text
-        text = clean_output_text(output.text)
+        if last_output is None:
+            return GenerationOutput(text="", finish_reason="stop")
 
+        text = clean_output_text(last_output.text)
         return GenerationOutput(
             text=text,
-            tokens=getattr(output, "tokens", []),
-            prompt_tokens=getattr(output, "prompt_tokens", 0),
-            completion_tokens=getattr(
-                output, "completion_tokens", len(getattr(output, "tokens", []))
-            ),
-            finish_reason=output.finish_reason,
+            tokens=list(last_output.tokens),
+            prompt_tokens=last_output.prompt_tokens,
+            completion_tokens=last_output.completion_tokens,
+            finish_reason=last_output.finish_reason,
+            finished=True,
         )
 
     async def stream_generate(
@@ -453,16 +470,11 @@ class SimpleEngine(BaseEngine):
         if not self._loaded:
             await self.start()
 
-        chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
-
         # mlx-lm non-streaming chat with tools can stall indefinitely on some
         # local models, while the streaming path completes normally. Reuse the
         # streaming implementation and aggregate its final state so both chat
         # APIs share the same tool-capable execution path.
         if tools and not self._is_mllm:
-            stream_kwargs = dict(kwargs)
-            if chat_template_kwargs:
-                stream_kwargs["chat_template_kwargs"] = chat_template_kwargs
             final_output = GenerationOutput(text="")
             async for output in self.stream_chat(
                 messages=messages,
@@ -472,10 +484,10 @@ class SimpleEngine(BaseEngine):
                 tools=tools,
                 images=images,
                 videos=videos,
-                **stream_kwargs,
+                **kwargs,
             ):
                 final_output = output
-            text = final_output.text
+            text = clean_output_text(final_output.text)
             return GenerationOutput(
                 text=text,
                 tokens=list(final_output.tokens),
@@ -488,8 +500,6 @@ class SimpleEngine(BaseEngine):
         template_tools = convert_tools_for_template(tools) if tools else None
 
         if self._is_mllm:
-            if chat_template_kwargs:
-                kwargs["chat_template_kwargs"] = chat_template_kwargs
             output = await self._run_blocking_serialized(
                 self._model.chat,
                 messages=messages,
@@ -506,8 +516,6 @@ class SimpleEngine(BaseEngine):
                 finish_reason=output.finish_reason,
             )
         else:
-            if chat_template_kwargs:
-                kwargs["chat_template_kwargs"] = chat_template_kwargs
             output = await self._run_blocking_serialized(
                 self._model.chat,
                 messages=messages,
@@ -518,8 +526,8 @@ class SimpleEngine(BaseEngine):
                 **kwargs,
             )
             text = clean_output_text(output.text)
-            # Preserve prompt accounting in the non-stream path after tool/chat
-            # template kwargs are applied to the underlying chat call.
+            # Preserve upstream prompt accounting while routing the blocking
+            # chat call through the cancellation-safe serialized runner.
             tokenizer = self._model.tokenizer
             template_kwargs = {
                 "tokenize": True,
@@ -527,8 +535,6 @@ class SimpleEngine(BaseEngine):
             }
             if template_tools:
                 template_kwargs["tools"] = template_tools
-            if chat_template_kwargs:
-                template_kwargs.update(chat_template_kwargs)
             prompt_ids = tokenizer.apply_chat_template(messages, **template_kwargs)
             prompt_token_count = len(prompt_ids)
             return GenerationOutput(
@@ -606,16 +612,13 @@ class SimpleEngine(BaseEngine):
 
             # Run stream_chat in thread pool since it's synchronous
             def run_stream():
-                local_kwargs = dict(kwargs)
-                if chat_template_kwargs:
-                    local_kwargs["chat_template_kwargs"] = chat_template_kwargs
                 return list(
                     self._model.stream_chat(
                         messages=messages,
                         max_tokens=max_tokens,
                         temperature=temperature,
                         tools=template_tools,
-                        **local_kwargs,
+                        **kwargs,
                     )
                 )
 
@@ -644,9 +647,10 @@ class SimpleEngine(BaseEngine):
         # For LLM, apply chat template and stream
         tokenizer = self._model.tokenizer
         if hasattr(tokenizer, "apply_chat_template"):
-            # Disable thinking mode for coder models since it interferes
-            # with tool call parsing (tags leak as raw text).
-            enable_thinking = "coder" not in self._model_name.lower()
+            # Per-request enable_thinking override; default: True unless coder model.
+            enable_thinking = kwargs.pop("enable_thinking", None)
+            if enable_thinking is None:
+                enable_thinking = "coder" not in self._model_name.lower()
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
@@ -708,121 +712,119 @@ class SimpleEngine(BaseEngine):
             try:
                 return _run_specprefill()
             except Exception as e:
-                logger.error(
-                    "SpecPrefill failed, falling back to normal path: %s", e
-                )
+                logger.error("SpecPrefill failed, falling back to normal path: %s", e)
                 return _run_normal()
 
-            def _run_specprefill():
-                """Score tokens, sparse prefill, generate autoregressively."""
-                import time
-                from types import SimpleNamespace
+        def _run_specprefill():
+            """Score tokens, sparse prefill, generate autoregressively."""
+            import time
+            from types import SimpleNamespace
 
-                from ..specprefill import (
-                    cleanup_rope,
-                    score_tokens,
-                    select_chunks,
-                    sparse_prefill,
+            from ..specprefill import (
+                cleanup_rope,
+                score_tokens,
+                select_chunks,
+                sparse_prefill,
+            )
+
+            cache = make_prompt_cache(model)
+
+            try:
+                # Phase 1: Score with draft model
+                t0 = time.monotonic()
+                importance = score_tokens(
+                    self._draft_model,
+                    tokens,
+                    prefill_step_size=self._prefill_step_size,
+                )
+                t_score = time.monotonic() - t0
+
+                # Phase 2: Select important chunks
+                effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
+                selected = select_chunks(importance, keep_pct=effective_keep)
+                n_selected = selected.shape[0]
+
+                # Phase 3: Sparse prefill on target model
+                t0 = time.monotonic()
+                logits = sparse_prefill(
+                    model,
+                    tokens,
+                    selected,
+                    cache,
+                    step_size=self._prefill_step_size,
+                )
+                t_prefill = time.monotonic() - t0
+
+                logger.info(
+                    "SpecPrefill: scored %d tokens in %.1fs, "
+                    "sparse prefill %d/%d (keep=%.0f%%) in %.1fs",
+                    n_tokens,
+                    t_score,
+                    n_selected,
+                    n_tokens,
+                    n_selected / n_tokens * 100,
+                    t_prefill,
                 )
 
-                cache = make_prompt_cache(model)
-
-                try:
-                    # Phase 1: Score with draft model
-                    t0 = time.monotonic()
-                    importance = score_tokens(
-                        self._draft_model,
-                        tokens,
-                        prefill_step_size=self._prefill_step_size,
-                    )
-                    t_score = time.monotonic() - t0
-
-                    # Phase 2: Select important chunks
-                    effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                    selected = select_chunks(importance, keep_pct=effective_keep)
-                    n_selected = selected.shape[0]
-
-                    # Phase 3: Sparse prefill on target model
-                    t0 = time.monotonic()
-                    logits = sparse_prefill(
-                        model,
-                        tokens,
-                        selected,
-                        cache,
-                        step_size=self._prefill_step_size,
-                    )
-                    t_prefill = time.monotonic() - t0
-
-                    logger.info(
-                        "SpecPrefill: scored %d tokens in %.1fs, "
-                        "sparse prefill %d/%d (keep=%.0f%%) in %.1fs",
-                        n_tokens,
-                        t_score,
-                        n_selected,
-                        n_tokens,
-                        n_selected / n_tokens * 100,
-                        t_prefill,
-                    )
-
-                    # Phase 4: Generate (simple autoregressive, no MTP)
-                    sampler = make_sampler(temp=temperature, top_p=top_p)
-                    eos_id = tokenizer.eos_token_id
-                    y = sampler(logits[:, -1, :])
-                    mx.eval(y)
-
-                    results = []
-                    generated_ids = []
-                    prev_decoded = ""
-
-                    for _ in range(max_tokens):
-                        tok_id = y.item()
-                        generated_ids.append(tok_id)
-
-                        decoded = tokenizer.decode(generated_ids)
-                        new_text = decoded[len(prev_decoded) :]
-                        prev_decoded = decoded
-
-                        is_eos = tok_id == eos_id
-                        results.append(
-                            SimpleNamespace(
-                                text=new_text,
-                                finish_reason="stop" if is_eos else None,
-                            )
-                        )
-
-                        if is_eos:
-                            break
-
-                        logits = model(y.reshape(1, -1), cache=cache)
-                        y = sampler(logits[:, -1, :])
-                        mx.eval(y)
-
-                    return results
-
-                finally:
-                    cleanup_rope(model)
-
-            def _run_normal():
-                """Fallback: normal generation without specprefill."""
-                from types import SimpleNamespace
+                # Phase 4: Generate (simple autoregressive, no MTP)
+                sampler = make_sampler(temp=temperature, top_p=top_p)
+                eos_id = tokenizer.eos_token_id
+                y = sampler(logits[:, -1, :])
+                mx.eval(y)
 
                 results = []
-                for chunk in self._model.stream_generate(
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                    **kwargs,
-                ):
-                    new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                generated_ids = []
+                prev_decoded = ""
+
+                for _ in range(max_tokens):
+                    tok_id = y.item()
+                    generated_ids.append(tok_id)
+
+                    decoded = tokenizer.decode(generated_ids)
+                    new_text = decoded[len(prev_decoded) :]
+                    prev_decoded = decoded
+
+                    is_eos = tok_id == eos_id
                     results.append(
                         SimpleNamespace(
                             text=new_text,
-                            finish_reason=getattr(chunk, "finish_reason", None),
+                            finish_reason="stop" if is_eos else None,
                         )
                     )
+
+                    if is_eos:
+                        break
+
+                    logits = model(y.reshape(1, -1), cache=cache)
+                    y = sampler(logits[:, -1, :])
+                    mx.eval(y)
+
                 return results
+
+            finally:
+                cleanup_rope(model)
+
+        def _run_normal():
+            """Fallback: normal generation without specprefill."""
+            from types import SimpleNamespace
+
+            results = []
+            for chunk in self._model.stream_generate(
+                prompt=prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
+                **kwargs,
+            ):
+                new_text = chunk.text if hasattr(chunk, "text") else str(chunk)
+                results.append(
+                    SimpleNamespace(
+                        text=new_text,
+                        finish_reason=getattr(chunk, "finish_reason", None),
+                    )
+                )
+            return results
 
         all_resps = await self._run_blocking_serialized(_run_all)
 
@@ -892,9 +894,11 @@ class SimpleEngine(BaseEngine):
         chat_template_kwargs = dict(kwargs.pop("chat_template_kwargs", {}) or {})
         logits_processors = kwargs.pop("logits_processors", None)
 
-        # Read enable_thinking from env (set by runtime_patches, consistent with MLLM path)
-        enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
-        enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
+        # Per-request enable_thinking override; fall back to env var / default True.
+        enable_thinking = kwargs.pop("enable_thinking", None)
+        if enable_thinking is None:
+            enable_thinking_env = os.environ.get("VLLM_MLX_ENABLE_THINKING", "true")
+            enable_thinking = enable_thinking_env.lower() in ("true", "1", "yes")
 
         # Apply chat template for full prompt
         template_kwargs = {
@@ -1164,102 +1168,102 @@ class SimpleEngine(BaseEngine):
             return results
 
         def _run_specprefill(model, bc):
-                """Score tokens, sparse prefill, generate without MTP."""
-                from types import SimpleNamespace
+            """Score tokens, sparse prefill, generate without MTP."""
+            from types import SimpleNamespace
 
-                from ..specprefill import (
-                    cleanup_rope,
-                    score_tokens,
-                    select_chunks,
-                    sparse_prefill,
+            from ..specprefill import (
+                cleanup_rope,
+                score_tokens,
+                select_chunks,
+                sparse_prefill,
+            )
+
+            # Create backbone cache if not already from system KV
+            if bc is None:
+                bc = make_prompt_cache(model)
+
+            try:
+                # Phase 1: Score with draft model
+                import time
+
+                t0 = time.monotonic()
+                importance = score_tokens(
+                    self._draft_model,
+                    specprefill_tokens,
+                    prefill_step_size=self._prefill_step_size,
+                )
+                t_score = time.monotonic() - t0
+
+                # Phase 2: Select important chunks
+                effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
+                selected = select_chunks(importance, keep_pct=effective_keep)
+                n_selected = selected.shape[0]
+                n_total = len(specprefill_tokens)
+
+                # Phase 3: Sparse prefill on target model
+                t0 = time.monotonic()
+                logits = sparse_prefill(
+                    model,
+                    specprefill_tokens,
+                    selected,
+                    bc,
+                    step_size=self._prefill_step_size,
+                    position_offset=specprefill_offset,
+                )
+                t_prefill = time.monotonic() - t0
+
+                logger.info(
+                    "SpecPrefill: scored %d tokens in %.1fs, "
+                    "sparse prefill %d/%d (keep=%.0f%%) in %.1fs "
+                    "(offset=%d, effective_keep=%.2f)",
+                    n_total,
+                    t_score,
+                    n_selected,
+                    n_total,
+                    n_selected / n_total * 100,
+                    t_prefill,
+                    specprefill_offset,
+                    effective_keep,
                 )
 
-                # Create backbone cache if not already from system KV
-                if bc is None:
-                    bc = make_prompt_cache(model)
+                # Phase 4: Generate (simple autoregressive, no MTP)
+                eos_id = self._text_tokenizer.eos_token_id
+                y = sampler(logits[:, -1, :])
+                mx.eval(y)
 
-                try:
-                    # Phase 1: Score with draft model
-                    import time
+                results = []
+                generated_ids = []
+                prev_decoded = ""
 
-                    t0 = time.monotonic()
-                    importance = score_tokens(
-                        self._draft_model,
-                        specprefill_tokens,
-                        prefill_step_size=self._prefill_step_size,
-                    )
-                    t_score = time.monotonic() - t0
+                for _ in range(max_tokens):
+                    tok_id = y.item()
+                    generated_ids.append(tok_id)
 
-                    # Phase 2: Select important chunks
-                    effective_keep = specprefill_keep_pct or self._specprefill_keep_pct
-                    selected = select_chunks(importance, keep_pct=effective_keep)
-                    n_selected = selected.shape[0]
-                    n_total = len(specprefill_tokens)
+                    # Incremental text decode
+                    decoded = self._text_tokenizer.decode(generated_ids)
+                    new_text = decoded[len(prev_decoded) :]
+                    prev_decoded = decoded
 
-                    # Phase 3: Sparse prefill on target model
-                    t0 = time.monotonic()
-                    logits = sparse_prefill(
-                        model,
-                        specprefill_tokens,
-                        selected,
-                        bc,
-                        step_size=self._prefill_step_size,
-                        position_offset=specprefill_offset,
-                    )
-                    t_prefill = time.monotonic() - t0
-
-                    logger.info(
-                        "SpecPrefill: scored %d tokens in %.1fs, "
-                        "sparse prefill %d/%d (keep=%.0f%%) in %.1fs "
-                        "(offset=%d, effective_keep=%.2f)",
-                        n_total,
-                        t_score,
-                        n_selected,
-                        n_total,
-                        n_selected / n_total * 100,
-                        t_prefill,
-                        specprefill_offset,
-                        effective_keep,
+                    is_eos = tok_id == eos_id
+                    results.append(
+                        SimpleNamespace(
+                            text=new_text,
+                            finish_reason="stop" if is_eos else None,
+                        )
                     )
 
-                    # Phase 4: Generate (simple autoregressive, no MTP)
-                    eos_id = self._text_tokenizer.eos_token_id
+                    if is_eos:
+                        break
+
+                    # Next token
+                    logits = model(y.reshape(1, -1), cache=bc)
                     y = sampler(logits[:, -1, :])
                     mx.eval(y)
 
-                    results = []
-                    generated_ids = []
-                    prev_decoded = ""
+                return results
 
-                    for _ in range(max_tokens):
-                        tok_id = y.item()
-                        generated_ids.append(tok_id)
-
-                        # Incremental text decode
-                        decoded = self._text_tokenizer.decode(generated_ids)
-                        new_text = decoded[len(prev_decoded) :]
-                        prev_decoded = decoded
-
-                        is_eos = tok_id == eos_id
-                        results.append(
-                            SimpleNamespace(
-                                text=new_text,
-                                finish_reason="stop" if is_eos else None,
-                            )
-                        )
-
-                        if is_eos:
-                            break
-
-                        # Next token
-                        logits = model(y.reshape(1, -1), cache=bc)
-                        y = sampler(logits[:, -1, :])
-                        mx.eval(y)
-
-                    return results
-
-                finally:
-                    cleanup_rope(model)
+            finally:
+                cleanup_rope(model)
 
         all_resps = await self._run_blocking_serialized(_run_all)
 
@@ -1303,6 +1307,7 @@ class SimpleEngine(BaseEngine):
         stats = {
             "engine_type": "simple",
             "model_name": self._model_name,
+            "uptime_seconds": time.time() - self._created_at,
             "is_mllm": self._is_mllm,
             "loaded": self._loaded,
         }

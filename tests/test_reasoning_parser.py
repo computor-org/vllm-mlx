@@ -6,6 +6,7 @@ Tests cover:
 - Parser registry (registration, lookup, listing)
 - Qwen3 parser (non-streaming and streaming)
 - DeepSeek-R1 parser (non-streaming and streaming)
+- Gemma 4 parser (channel protocol, streaming, channel name stripping)
 - Edge cases (no tags, partial tags, etc.)
 """
 
@@ -28,6 +29,7 @@ class TestParserRegistry:
         parsers = list_parsers()
         assert "qwen3" in parsers
         assert "deepseek_r1" in parsers
+        assert "gemma4" in parsers
 
     def test_get_parser_qwen3(self):
         """Should be able to get Qwen3 parser."""
@@ -920,3 +922,399 @@ class TestGptOssParser:
         reasoning, content = parser.extract_reasoning(output)
         assert "<|constrain|>" not in (content or "")
         assert "<|channel|>" not in (content or "")
+
+
+class TestGemma4Parser:
+    """Tests for the Gemma 4 reasoning parser (channel-based protocol)."""
+
+    @pytest.fixture
+    def parser(self):
+        """Create a fresh Gemma 4 parser for each test."""
+        return get_parser("gemma4")()
+
+    # --- Non-streaming tests ---
+
+    def test_extract_standard_format(self, parser):
+        """Standard format: <|channel>thought...<channel|>response."""
+        output = (
+            "<|channel>thought\nLet me think step by step.\n<channel|>The answer is 42."
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "Let me think step by step."
+        assert content == "The answer is 42."
+
+    def test_extract_alternative_format(self, parser):
+        """Alternative format: <|channel>thought...<|channel>response..."""
+        output = "<|channel>thought\nAnalyzing the problem.\n<|channel>response\nThe result is 7."
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "Analyzing the problem."
+        assert content == "The result is 7."
+
+    def test_extract_strips_thought_prefix(self, parser):
+        """Channel name 'thought' should be stripped from reasoning."""
+        output = "<|channel>thought\nActual reasoning here<channel|>Content"
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "Actual reasoning here"
+        assert "thought" not in reasoning
+
+    def test_extract_no_tags_pure_content(self, parser):
+        """No channel tags at all should return pure content."""
+        output = "Just a regular response without thinking."
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning is None
+        assert content == output
+
+    def test_extract_only_start_tag(self, parser):
+        """Only start tag means incomplete reasoning (no content yet)."""
+        output = "<|channel>thought\nStill thinking..."
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "Still thinking..."
+        assert content is None
+
+    def test_extract_only_end_tag(self, parser):
+        """Only end tag (think injected in prompt)."""
+        output = "thought\nImplicit reasoning<channel|>The answer"
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "Implicit reasoning"
+        assert content == "The answer"
+
+    def test_extract_empty_reasoning(self, parser):
+        """Empty reasoning should return None."""
+        output = "<|channel>thought\n<channel|>Only content here."
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning is None
+        assert content == "Only content here."
+
+    def test_extract_multiline_reasoning(self, parser):
+        """Should preserve multiline reasoning content."""
+        output = (
+            "<|channel>thought\n"
+            "Step 1: Understand the question.\n"
+            "Step 2: Analyze the data.\n"
+            "Step 3: Form conclusion.\n"
+            "<channel|>The conclusion is clear."
+        )
+        reasoning, content = parser.extract_reasoning(output)
+        assert "Step 1" in reasoning
+        assert "Step 2" in reasoning
+        assert "Step 3" in reasoning
+        assert content == "The conclusion is clear."
+
+    def test_extract_unicode_reasoning(self, parser):
+        """Should handle Unicode in reasoning."""
+        output = "<|channel>thought\n日本語テスト 🤔\n<channel|>答えは42"
+        reasoning, content = parser.extract_reasoning(output)
+        assert "日本語テスト" in reasoning
+        assert "🤔" in reasoning
+        assert "42" in content
+
+    def test_registry_includes_gemma4(self):
+        """gemma4 should be in the parser registry."""
+        assert "gemma4" in list_parsers()
+
+    # --- Streaming tests ---
+
+    def test_streaming_no_tags_plain_content(self, parser):
+        """Streaming without any channel tags should return content."""
+        parser.reset_state()
+        result = parser.extract_reasoning_streaming("", "Hello", "Hello")
+        assert result is not None
+        assert result.content == "Hello"
+        assert result.reasoning is None
+
+    def test_streaming_standard_format(self, parser):
+        """Test streaming through <|channel>thought...<channel|>content flow."""
+        parser.reset_state()
+
+        tokens = [
+            "<|channel>",
+            "thought",
+            "\n",
+            "Let me ",
+            "think.",
+            "<channel|>",
+            "The ",
+            "answer.",
+        ]
+
+        accumulated = ""
+        reasoning_parts = []
+        content_parts = []
+
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+
+        full_reasoning = "".join(reasoning_parts)
+        full_content = "".join(content_parts)
+
+        # "thought\n" prefix should be stripped
+        assert "thought" not in full_reasoning or "thought" in "Let me think."
+        assert "Let me think." in full_reasoning
+        assert "The answer." in full_content
+
+    def test_streaming_alternative_format(self, parser):
+        """Test streaming with <|channel>response transition."""
+        parser.reset_state()
+
+        tokens = [
+            "<|channel>",
+            "thought",
+            "\n",
+            "Analyzing.",
+            "<|channel>response",
+            "\n",
+            "Result: ",
+            "42",
+        ]
+
+        accumulated = ""
+        reasoning_parts = []
+        content_parts = []
+
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+
+        full_content = "".join(content_parts)
+        assert "Result: 42" in full_content
+
+    def test_streaming_suppresses_channel_names(self, parser):
+        """Channel names 'thought' and 'response' should not appear in output."""
+        parser.reset_state()
+
+        # Simulate realistic Gemma 4 output
+        tokens = [
+            "<|channel>",
+            "thought",
+            "\n",
+            "Real ",
+            "reasoning.",
+            "<channel|>",
+            "Real ",
+            "content.",
+        ]
+
+        accumulated = ""
+        all_output = []
+
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    all_output.append(("r", result.reasoning))
+                if result.content:
+                    all_output.append(("c", result.content))
+
+        # Verify no raw "thought" token leaked as reasoning
+        reasoning_text = "".join(t for tag, t in all_output if tag == "r")
+        content_text = "".join(t for tag, t in all_output if tag == "c")
+
+        assert "Real reasoning." in reasoning_text
+        assert "Real content." in content_text
+
+    def test_streaming_token_by_token(self, parser):
+        """Test character-by-character streaming (worst case)."""
+        parser.reset_state()
+
+        output = "<|channel>thought\nStep 1: Think\nStep 2: Analyze\n<channel|>Final answer: 42."
+
+        accumulated = ""
+        reasoning_parts = []
+        content_parts = []
+
+        for char in output:
+            prev = accumulated
+            accumulated += char
+            result = parser.extract_reasoning_streaming(prev, accumulated, char)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+
+        full_reasoning = "".join(reasoning_parts)
+        full_content = "".join(content_parts)
+
+        assert "Step 1: Think" in full_reasoning
+        assert "Step 2: Analyze" in full_reasoning
+        assert "Final answer: 42." in full_content
+
+    def test_streaming_long_thinking_no_end_tag(self, parser):
+        """When model generates long thinking without end tag, all goes to reasoning."""
+        parser.reset_state()
+
+        # Simulate model that hits max_tokens before <channel|>
+        tokens = [
+            "<|channel>",
+            "thought",
+            "\n",
+            "This is a very long ",
+            "reasoning process ",
+            "that continues ",
+            "without ending.",
+        ]
+
+        accumulated = ""
+        reasoning_parts = []
+        content_parts = []
+
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+
+        full_reasoning = "".join(reasoning_parts)
+        assert "very long reasoning process" in full_reasoning
+        assert len(content_parts) == 0
+
+
+class TestGlm4Parser:
+    """Tests for the GLM-4 reasoning parser."""
+
+    @pytest.fixture
+    def parser(self):
+        """Create a fresh GLM-4 parser for each test."""
+        return get_parser("glm4")()
+
+    def test_registry_includes_glm4(self):
+        """glm4 should be in the parser registry."""
+        assert "glm4" in list_parsers()
+
+    # Non-streaming tests
+
+    def test_extract_with_both_tags(self, parser):
+        """Should extract reasoning when both tags present."""
+        output = "<think>Let me analyze this</think>The answer is 42."
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "Let me analyze this"
+        assert content == "The answer is 42."
+
+    def test_no_tags_returns_content(self, parser):
+        """GLM-4 without tags = normal content (not reasoning)."""
+        output = "Just a regular response."
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning is None
+        assert content == output
+
+    def test_implicit_mode(self, parser):
+        """Only closing tag (think injected by agent)."""
+        output = "reasoning text</think>content text"
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "reasoning text"
+        assert content == "content text"
+
+    def test_strips_box_tags(self, parser):
+        """GLM-4.6V box container tags should be stripped."""
+        output = "<|begin_of_box|>Paris<|end_of_box|>"
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning is None
+        assert content == "Paris"
+
+    def test_strips_box_tags_with_thinking(self, parser):
+        """Box tags should be stripped from reasoning output too."""
+        output = "<think><|begin_of_box|>analysis</think><|begin_of_box|>answer<|end_of_box|>"
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "analysis"
+        assert content == "answer"
+
+    # Streaming tests
+
+    def test_streaming_no_tags_emits_content(self, parser):
+        """GLM-4 streaming without tags should emit content (not reasoning)."""
+        parser.reset_state()
+        result = parser.extract_reasoning_streaming("", "Hello", "Hello")
+        assert result is not None
+        assert result.content == "Hello"
+        assert result.reasoning is None
+
+    def test_streaming_with_thinking(self, parser):
+        """Test streaming with think tags."""
+        parser.reset_state()
+
+        tokens = ["<think>", "analyze", "</think>", "answer"]
+        accumulated = ""
+        reasoning_parts = []
+        content_parts = []
+
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+
+        assert "analyze" in "".join(reasoning_parts)
+        assert "answer" in "".join(content_parts)
+
+    def test_streaming_strips_box_tags(self, parser):
+        """Box tags should be stripped from streaming deltas."""
+        parser.reset_state()
+
+        tokens = ["<|begin_of_box|>", "Paris", "<|end_of_box|>"]
+        accumulated = ""
+        content_parts = []
+
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result and result.content:
+                content_parts.append(result.content)
+
+        full = "".join(content_parts)
+        assert "Paris" in full
+        assert "<|begin_of_box|>" not in full
+        assert "<|end_of_box|>" not in full
+
+    def test_streaming_box_tag_returns_none(self, parser):
+        """A delta that is purely a box tag should return None."""
+        parser.reset_state()
+        result = parser.extract_reasoning_streaming(
+            "", "<|begin_of_box|>", "<|begin_of_box|>"
+        )
+        assert result is None
+
+
+class TestDuplicateThinkEndTag:
+    """Test duplicate </think> stripping in BaseThinkingReasoningParser."""
+
+    @pytest.fixture(params=["qwen3", "deepseek_r1", "glm4"])
+    def parser(self, request):
+        return get_parser(request.param)()
+
+    def test_duplicate_end_tag_stripped(self, parser):
+        """Extra </think> after reasoning should be stripped from content."""
+        output = "<think>reasoning</think></think>content"
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "reasoning"
+        assert content == "content"
+
+    def test_triple_end_tag_stripped(self, parser):
+        """Multiple extra </think> tags should all be stripped."""
+        output = "<think>reasoning</think></think></think>content"
+        reasoning, content = parser.extract_reasoning(output)
+        assert reasoning == "reasoning"
+        assert content == "content"

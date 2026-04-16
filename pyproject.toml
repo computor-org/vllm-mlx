@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-mlx"
-version = "0.2.7"
+version = "0.2.8"
 description = "vLLM-like inference for Apple Silicon - GPU-accelerated Text, Image, Video & Audio on Mac"
 readme = "README.md"
 license = {text = "Apache-2.0"}
@@ -30,7 +30,7 @@ classifiers = [
 dependencies = [
     "mlx>=0.29.0",
     "mlx-lm>=0.31.0",  # 0.31+ required for ArraysCache native batching (hybrid models)
-    "mlx-vlm>=0.1.0",  # VLM support
+    "mlx-vlm>=0.4.3",  # 0.4.3+ required for Gemma 4 support
     "transformers>=5.0.0",  # mlx-lm 0.30.5+ requires transformers 5.0 (rc3 bug fixed in stable)
     "tokenizers>=0.19.0",
     "huggingface-hub>=0.23.0",
@@ -44,12 +44,13 @@ dependencies = [
     # Video processing for VLM
     "opencv-python>=4.8.0",
     # Vision processor (required for transformers AutoProcessor)
-    "torchvision>=0.18.0",
+    "torchvision>=0.23.0",
     # Resource monitoring
     "psutil>=5.9.0",
     # Server
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
+    "prometheus-client>=0.20.0",
     # MCP (Model Context Protocol) support
     "mcp>=1.0.0",
     # JSON Schema validation for structured output
@@ -74,8 +75,8 @@ vllm = [
     "vllm>=0.4.0",
 ]
 vision = [
-    "torch>=2.3.0",
-    "torchvision>=0.18.0",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
 ]
 # Audio dependencies for TTS/STT (mlx-audio)
 guided = [
@@ -112,6 +113,7 @@ mlx = "vllm_mlx.plugin:mlx_platform_plugin"
 [project.scripts]
 vllm-mlx = "vllm_mlx.cli:main"
 vllm-mlx-chat = "vllm_mlx.gradio_app:main"
+vllm-mlx-text-chat = "vllm_mlx.gradio_text_app:main"
 vllm-mlx-bench = "vllm_mlx.benchmark:main"
 
 [tool.setuptools.packages.find]
